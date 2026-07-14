@@ -14,18 +14,19 @@
 # limitations under the License.
 
 """
-Tests for bitstream_offset and pagination functionality.
+Tests for TIFF IFD offset traversal functionality.
 
 This module tests:
 1. subifd_offsets property for accessing SubIFD byte offsets
 2. bitstream_offset parameter for CodeStream creation and get_sub_code_stream
-3. limit_images parameter for pagination
-4. next_bitstream_offset for pagination continuation
+3. ifd_offset and next_ifd_offset for IFD-chain traversal
+4. Python validation when ambiguous TIFF views are applied to streams
 5. Decoding images via SubIFD offset
 """
 
 from __future__ import annotations
 import os
+import struct
 import numpy as np
 from nvidia import nvimgcodec
 import pytest as t
@@ -37,11 +38,43 @@ CAT_WITH_THUMBNAIL = "tiff/cat_with_thumbnail.tiff"
 CAT_MAIN_WIDTH, CAT_MAIN_HEIGHT = 720, 720
 CAT_THUMB_WIDTH, CAT_THUMB_HEIGHT = 180, 180
 
-# Multi-page TIFF for pagination tests
+# Multi-page TIFF for IFD traversal tests
 MULTI_PAGE_TIFF = "tiff/multi_page.tif"
 
 # JPEG for non-TIFF tests
 JPEG_PATH = "jpeg/padlock-406986_640_420.jpg"
+
+def chained_ifd_tiff(num_ifds=1, *, tail="cycle"):
+    """Build a classic little-endian TIFF with `num_ifds` minimal 16x16 IFDs
+    chained head-to-tail. The final IFD's next pointer either loops back to the
+    first IFD (tail="cycle") or points past EOF (tail="oob"), so walking past the
+    last IFD fails while reaching any index in [0, num_ifds) succeeds."""
+    HEADER_SIZE = 8
+    IFD_SIZE = 2 + 4 * 12 + 4  # entry count + 4 entries + next-IFD offset
+
+    def entry(tag, typ, value):
+        return struct.pack("<HHII", tag, typ, 1, value)  # tag, type, count=1, inline value
+
+    data = bytearray(struct.pack("<2sHI", b"II", 42, HEADER_SIZE))  # header -> first IFD at offset 8
+    for i in range(num_ifds):
+        this_off = HEADER_SIZE + i * IFD_SIZE
+        if i < num_ifds - 1:
+            next_off = this_off + IFD_SIZE
+        elif tail == "cycle":
+            next_off = HEADER_SIZE
+        else:  # "oob": past end of file
+            next_off = HEADER_SIZE + num_ifds * IFD_SIZE + 4096
+        data += struct.pack("<H", 4)   # 4 directory entries
+        data += entry(256, 4, 16)      # ImageWidth      (LONG)  = 16
+        data += entry(257, 4, 16)      # ImageLength     (LONG)  = 16
+        data += entry(258, 3, 8)       # BitsPerSample   (SHORT) = 8
+        data += entry(277, 3, 1)       # SamplesPerPixel (SHORT) = 1
+        data += struct.pack("<I", next_off)
+    return bytes(data)
+
+
+def cyclic_root_ifd_tiff():
+    return chained_ifd_tiff(1, tail="cycle")
 
 
 class TestSubIFDOffsetsProperty:
@@ -216,6 +249,19 @@ class TestBitstreamOffsetInheritance:
         np.testing.assert_array_equal(parent_img, child_img,
             err_msg="Child sub-code stream should decode same image as parent")
 
+    def test_inherited_bitstream_offset_rejects_nonzero_image_idx(self):
+        """Test that inherited bitstream_offset cannot be combined with nonzero image_idx."""
+        fpath = os.path.join(img_dir_path, CAT_WITH_THUMBNAIL)
+        cs = nvimgcodec.CodeStream(fpath)
+
+        offsets = cs.subifd_offsets
+        assert len(offsets) > 0, "Test file should have SubIFD"
+
+        parent_cs = cs.get_sub_code_stream(bitstream_offset=offsets[0])
+
+        with t.raises(RuntimeError, match="Cannot apply nonzero image_idx to a sub code stream"):
+            parent_cs.get_sub_code_stream(image_idx=1)
+
     def test_bitstream_offset_not_inherited_when_explicitly_set(self):
         """Test that explicit bitstream_offset overrides parent's offset."""
         fpath = os.path.join(img_dir_path, CAT_WITH_THUMBNAIL)
@@ -237,226 +283,118 @@ class TestBitstreamOffsetInheritance:
         assert parent_cs.height == CAT_THUMB_HEIGHT, f"Thumbnail height should be {CAT_THUMB_HEIGHT}, got {parent_cs.height}"
 
 
-class TestPagination:
-    """Tests for pagination with limit_images and next_bitstream_offset."""
+class TestIfdTraversal:
+    """Tests for TIFF IFD-chain traversal via ifd_offset and next_ifd_offset."""
 
-    def test_limit_images_restricts_num_images(self):
-        """Test that limit_images restricts the number of images in code stream."""
+    def test_root_reports_current_and_next_ifd_offsets(self):
+        """Test that root CodeStream exposes the first and second top-level IFD offsets."""
         fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
         cs = nvimgcodec.CodeStream(fpath)
 
         total_images = cs.num_images
         assert total_images > 2, f"Test file should have >2 images, got {total_images}"
 
-        # Create sub-code stream with limit
-        limit = 2
-        limited_cs = cs.get_sub_code_stream(limit_images=limit)
+        assert isinstance(cs.ifd_offset, int)
+        assert cs.ifd_offset > 0
+        assert isinstance(cs.next_ifd_offset, int)
+        assert cs.next_ifd_offset > 0
+        assert cs.next_ifd_offset != cs.ifd_offset
 
-        assert limited_cs.num_images == limit, \
-            f"Limited code stream should have {limit} images, got {limited_cs.num_images}"
-
-    def test_next_bitstream_offset_for_pagination(self):
-        """Test that next_bitstream_offset allows continuing pagination."""
+    def test_offset_selected_stream_is_single_image_and_reports_next_ifd(self):
+        """Test that a CodeStream selected by IFD offset represents exactly that image."""
         fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
         cs = nvimgcodec.CodeStream(fpath)
 
-        total_images = cs.num_images
-        assert total_images >= 4, f"Test file should have >=4 images, got {total_images}"
+        second_offset = cs.next_ifd_offset
+        assert second_offset is not None, "Test file should have a second IFD"
 
-        # Get first batch
-        batch_size = 2
-        batch1_cs = cs.get_sub_code_stream(limit_images=batch_size)
+        second_by_offset = cs.get_sub_code_stream(bitstream_offset=second_offset)
+        second_by_index = cs.get_sub_code_stream(image_idx=1)
 
-        assert batch1_cs.num_images == batch_size
+        assert second_by_offset.num_images == 1
+        assert second_by_offset.ifd_offset == second_offset
+        assert second_by_offset.width == second_by_index.width
+        assert second_by_offset.height == second_by_index.height
 
-        # Get next offset
-        next_offset = batch1_cs.next_bitstream_offset
-        assert next_offset is not None, "next_bitstream_offset should not be None when more images exist"
-
-        # Get second batch starting from next offset
-        batch2_cs = cs.get_sub_code_stream(bitstream_offset=next_offset, limit_images=batch_size)
-
-        assert batch2_cs.num_images == batch_size, \
-            f"Second batch should have {batch_size} images, got {batch2_cs.num_images}"
-
-    def test_pagination_accesses_different_pages(self):
-        """Test that pagination actually accesses different pages by comparing dimensions."""
+    def test_image_idx_substream_is_single_image_and_reports_next_ifd(self):
+        """Test that image_idx selection also produces a one-image view."""
         fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
-        cs = nvimgcodec.CodeStream(fpath)
+        root = nvimgcodec.CodeStream(fpath)
 
-        total_images = cs.num_images
-        assert total_images >= 4, f"Test file should have >=4 images"
+        second_by_index = root.get_sub_code_stream(image_idx=1)
 
-        # Get first page dimensions
-        page0 = cs.get_sub_code_stream(image_idx=0)
-        page0_dims = (page0.width, page0.height)
+        assert second_by_index.num_images == 1
+        assert second_by_index.ifd_offset is not None
+        assert second_by_index.next_ifd_offset is not None
 
-        # Get third page dimensions (page 3 has different size in multi_page.tif)
-        page3 = cs.get_sub_code_stream(image_idx=3)
-        page3_dims = (page3.width, page3.height)
-
-        # Verify pages have different dimensions (multi_page.tif has varied sizes)
-        assert page0_dims != page3_dims, \
-            f"Test file should have pages with different dimensions, got {page0_dims} and {page3_dims}"
-
-        # Now test pagination - get batch starting at page 3
-        batch1 = cs.get_sub_code_stream(limit_images=3)
-        next_offset = batch1.next_bitstream_offset
-        assert next_offset is not None, "Should have more pages"
-
-        # Get batch starting at offset (should be page 3)
-        batch2 = cs.get_sub_code_stream(bitstream_offset=next_offset, limit_images=1)
-        batch2_first = batch2.get_sub_code_stream(image_idx=0)
-
-        # Batch2's first page should have page3's dimensions
-        assert batch2_first.width == page3_dims[0], "Pagination should access page 3"
-        assert batch2_first.height == page3_dims[1], "Pagination should access page 3"
-
-
-class TestPaginationEdgeCases:
-    """Tests for pagination edge cases."""
-
-    def test_limit_images_one(self):
-        """Test pagination with limit_images=1."""
+    def test_page_zero_substream_rejects_nested_nonzero_image_idx(self):
+        """Test that any image_idx-selected substream remains a one-image view."""
         fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
-        cs = nvimgcodec.CodeStream(fpath)
+        root = nvimgcodec.CodeStream(fpath)
 
-        total_images = cs.num_images
-        assert total_images > 1, "Test file should have >1 images"
+        page0 = root.get_sub_code_stream(image_idx=0)
 
-        limited_cs = cs.get_sub_code_stream(limit_images=1)
-        assert limited_cs.num_images == 1, \
-            f"limit_images=1 should return 1 image, got {limited_cs.num_images}"
+        with t.raises(RuntimeError):
+            page0.get_sub_code_stream(image_idx=1)
 
-        # Should have next offset since there are more images
-        assert limited_cs.next_bitstream_offset is not None, \
-            "next_bitstream_offset should not be None when more images exist"
-
-    def test_limit_images_greater_than_total(self):
-        """Test that limit_images greater than total returns all images."""
+    def test_next_ifd_offset_chain_visits_all_root_images(self):
+        """Test that walking next_ifd_offset visits each top-level image once."""
         fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
-        cs = nvimgcodec.CodeStream(fpath)
+        root = nvimgcodec.CodeStream(fpath)
 
-        total_images = cs.num_images
-        large_limit = total_images + 100
-
-        limited_cs = cs.get_sub_code_stream(limit_images=large_limit)
-        assert limited_cs.num_images == total_images, \
-            f"limit_images > total should return all {total_images} images, got {limited_cs.num_images}"
-
-        # No more images, so next_bitstream_offset should be None
-        assert limited_cs.next_bitstream_offset is None, \
-            "next_bitstream_offset should be None when no more images exist"
-
-    def test_limit_images_zero_means_no_limit(self):
-        """Test that limit_images=0 returns all images (no limit)."""
-        fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
-        cs = nvimgcodec.CodeStream(fpath)
-
-        total_images = cs.num_images
-
-        # limit_images=0 should mean no limit
-        unlimited_cs = cs.get_sub_code_stream(limit_images=0)
-        assert unlimited_cs.num_images == total_images, \
-            f"limit_images=0 should return all {total_images} images, got {unlimited_cs.num_images}"
-
-    def test_next_bitstream_offset_none_on_last_page(self):
-        """Test that next_bitstream_offset is None when on last page."""
-        fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
-        cs = nvimgcodec.CodeStream(fpath)
-
-        total_images = cs.num_images
-
-        # Get all images - should have no next offset
-        all_cs = cs.get_sub_code_stream(limit_images=total_images)
-        assert all_cs.next_bitstream_offset is None, \
-            "next_bitstream_offset should be None when all images are included"
-
-    def test_pagination_chain_visits_all_images(self):
-        """Test that chaining pagination visits all images exactly once."""
-        fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
-        cs = nvimgcodec.CodeStream(fpath)
-
-        total_images = cs.num_images
+        total_images = root.num_images
         assert total_images >= 4, "Test file should have >=4 images"
 
-        batch_size = 2
-        visited_count = 0
-        current_offset = None
-
-        # Chain through all batches
+        visited_offsets = []
+        current = root
         while True:
-            if current_offset is None:
-                batch_cs = cs.get_sub_code_stream(limit_images=batch_size)
-            else:
-                batch_cs = cs.get_sub_code_stream(bitstream_offset=current_offset, limit_images=batch_size)
-
-            visited_count += batch_cs.num_images
-            current_offset = batch_cs.next_bitstream_offset
-
-            if current_offset is None:
-                break
-
-        assert visited_count == total_images, \
-            f"Pagination should visit all {total_images} images, visited {visited_count}"
-
-    def test_pagination_last_batch_partial(self):
-        """Test pagination with odd number of images in last batch."""
-        fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
-        cs = nvimgcodec.CodeStream(fpath)
-
-        total_images = cs.num_images
-        # Choose batch size that doesn't divide evenly
-        batch_size = 3
-        expected_last_batch = total_images % batch_size
-        if expected_last_batch == 0:
-            expected_last_batch = batch_size
-
-        # Navigate to last batch
-        current_offset = None
-        while True:
-            if current_offset is None:
-                batch_cs = cs.get_sub_code_stream(limit_images=batch_size)
-            else:
-                batch_cs = cs.get_sub_code_stream(bitstream_offset=current_offset, limit_images=batch_size)
-
-            next_offset = batch_cs.next_bitstream_offset
+            visited_offsets.append(current.ifd_offset)
+            next_offset = current.next_ifd_offset
             if next_offset is None:
-                # This is the last batch
-                last_batch_count = batch_cs.num_images
                 break
-            current_offset = next_offset
+            current = root.get_sub_code_stream(bitstream_offset=next_offset)
 
-        assert last_batch_count == expected_last_batch, \
-            f"Last batch should have {expected_last_batch} images, got {last_batch_count}"
+        assert len(visited_offsets) == total_images
+        assert len(set(visited_offsets)) == total_images
 
-    def test_different_limit_images_on_same_stream(self):
-        """Test that changing limit_images on the same file invalidates the
-        decoder's parsed-stream cache and produces correct results."""
+    def test_ifd_traversal_accesses_same_pages_as_image_idx(self):
+        """Test that offset traversal and image_idx traversal select the same IFDs."""
         fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
-        decoder = nvimgcodec.Decoder()
+        root = nvimgcodec.CodeStream(fpath)
 
-        # First decode with limit_images=2
-        cs1 = nvimgcodec.CodeStream(fpath, limit_images=2)
-        assert cs1.num_images == 2, \
-            f"First code stream should have 2 images, got {cs1.num_images}"
-        imgs1 = decoder.decode(cs1)
+        total_images = root.num_images
+        assert total_images >= 4, "Test file should have >=4 images"
 
-        # Second decode of the same file with a different limit_images
-        cs2 = nvimgcodec.CodeStream(fpath, limit_images=4)
-        assert cs2.num_images == 4, \
-            f"Second code stream should have 4 images, got {cs2.num_images}"
-        imgs2 = decoder.decode(cs2)
+        current = root
+        for image_idx in range(total_images):
+            by_index = root.get_sub_code_stream(image_idx=image_idx)
 
-        # Third decode with no limit (all images)
-        cs3 = nvimgcodec.CodeStream(fpath)
-        total_images = cs3.num_images
-        assert total_images > 4, "Test file should have >4 images"
-        imgs3 = decoder.decode(cs3)
+            assert current.width == by_index.width
+            assert current.height == by_index.height
+            assert current.ifd_offset == by_index.ifd_offset
+
+            next_offset = current.next_ifd_offset
+            if next_offset is None:
+                break
+            current = root.get_sub_code_stream(bitstream_offset=next_offset)
+
+    def test_next_ifd_offset_none_on_last_page(self):
+        """Test that next_ifd_offset is None for the last IFD in the root chain."""
+        fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
+        root = nvimgcodec.CodeStream(fpath)
+
+        current = root
+        while True:
+            next_offset = current.next_ifd_offset
+            if next_offset is None:
+                break
+            current = root.get_sub_code_stream(bitstream_offset=next_offset)
+
+        assert current.next_ifd_offset is None
 
 
 class TestTopLevelCodeStreamParameters:
-    """Tests for bitstream_offset and limit_images at CodeStream creation."""
+    """Tests for bitstream_offset at CodeStream creation."""
 
     def test_codestream_bitstream_offset_parameter(self):
         """Test that CodeStream accepts bitstream_offset at creation."""
@@ -477,49 +415,6 @@ class TestTopLevelCodeStreamParameters:
         assert thumb_cs.width == CAT_THUMB_WIDTH, f"Thumbnail width should be {CAT_THUMB_WIDTH}, got {thumb_cs.width}"
         assert thumb_cs.height == CAT_THUMB_HEIGHT, f"Thumbnail height should be {CAT_THUMB_HEIGHT}, got {thumb_cs.height}"
 
-    def test_codestream_limit_images_parameter(self):
-        """Test that CodeStream accepts limit_images at creation."""
-        fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
-
-        # Without limit
-        cs_all = nvimgcodec.CodeStream(fpath)
-        total_images = cs_all.num_images
-        assert total_images > 2, "Test file should have >2 images"
-
-        # With limit
-        cs_limited = nvimgcodec.CodeStream(fpath, limit_images=2)
-        assert cs_limited.num_images == 2, \
-            f"CodeStream with limit_images=2 should have 2 images, got {cs_limited.num_images}"
-
-    def test_codestream_combined_parameters(self):
-        """Test CodeStream with both bitstream_offset and limit_images."""
-        fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
-        cs = nvimgcodec.CodeStream(fpath)
-
-        total_images = cs.num_images
-        assert total_images >= 4, "Test file should have >=4 images"
-
-        # Get offset to second page
-        batch1 = cs.get_sub_code_stream(limit_images=1)
-        second_page_offset = batch1.next_bitstream_offset
-        assert second_page_offset is not None, "Should have offset to second page"
-
-        # Create CodeStream starting at second page, limited to 2 images
-        cs_partial = nvimgcodec.CodeStream(fpath, bitstream_offset=second_page_offset, limit_images=2)
-        assert cs_partial.num_images == 2, \
-            f"Expected 2 images, got {cs_partial.num_images}"
-
-        # Verify dimensions match second page (not first page)
-        second_page_cs = cs.get_sub_code_stream(image_idx=1)
-
-        # The partial CodeStream's first image should match original second page
-        partial_first = cs_partial.get_sub_code_stream(image_idx=0)
-        assert partial_first.width == second_page_cs.width, \
-            "First image of partial should match second page width"
-        assert partial_first.height == second_page_cs.height, \
-            "First image of partial should match second page height"
-
-
 class TestCodeStreamViewBitstreamOffset:
     """Tests for CodeStreamView bitstream_offset parameter."""
 
@@ -530,28 +425,30 @@ class TestCodeStreamViewBitstreamOffset:
         assert view.image_idx == 0
         assert view.bitstream_offset == 1000
 
-    def test_code_stream_view_limit_images(self):
-        """Test that CodeStreamView properly stores limit_images."""
-        view = nvimgcodec.CodeStreamView(image_idx=0, limit_images=5)
-
-        assert view.image_idx == 0
-        assert view.limit_images == 5
-
-    def test_code_stream_view_combined_params(self):
-        """Test that CodeStreamView properly stores all parameters."""
-        view = nvimgcodec.CodeStreamView(
-            image_idx=2,
-            bitstream_offset=5000,
-            limit_images=10
-        )
+    def test_code_stream_view_stores_image_idx_with_bitstream_offset(self):
+        """CodeStreamView is a value object; ambiguity is rejected when used."""
+        view = nvimgcodec.CodeStreamView(image_idx=2, bitstream_offset=5000)
 
         assert view.image_idx == 2
         assert view.bitstream_offset == 5000
-        assert view.limit_images == 10
+
+    def test_code_stream_view_accepts_bitstream_offset_zero(self):
+        """Explicit bitstream_offset=0 is the default offset."""
+        view = nvimgcodec.CodeStreamView(bitstream_offset=0)
+
+        assert view.image_idx == 0
+        assert view.bitstream_offset == 0
+
+    def test_code_stream_view_accepts_bitstream_offset_none(self):
+        """Test that None remains the Python spelling for the default offset."""
+        view = nvimgcodec.CodeStreamView(bitstream_offset=None)
+
+        assert view.image_idx == 0
+        assert view.bitstream_offset == 0
 
 
 class TestErrorHandling:
-    """Tests for error handling in pagination."""
+    """Tests for error handling in TIFF IFD traversal."""
 
     def test_invalid_bitstream_offset_raises_error(self):
         """Test that invalid bitstream_offset raises an error."""
@@ -571,12 +468,138 @@ class TestErrorHandling:
         fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
         cs = nvimgcodec.CodeStream(fpath)
 
-        # Get the offset to the second page (a valid IFD offset)
-        batch1 = cs.get_sub_code_stream(limit_images=1)
-        second_ifd_offset = batch1.next_bitstream_offset
+        second_ifd_offset = cs.next_ifd_offset
         assert second_ifd_offset is not None, "Should have second IFD"
 
         # Create CodeStream at that offset - should work
         cs_at_offset = nvimgcodec.CodeStream(fpath, bitstream_offset=second_ifd_offset)
         assert cs_at_offset.width > 0, "Should successfully parse at valid IFD offset"
         assert cs_at_offset.height > 0, "Should successfully parse at valid IFD offset"
+
+    def test_direct_bitstream_offset_reports_next_ifd_offset(self):
+        """Test that direct offset streams can continue root IFD traversal."""
+        fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
+        root = nvimgcodec.CodeStream(fpath)
+        second_ifd_offset = root.next_ifd_offset
+        assert second_ifd_offset is not None, "Test file should have a second IFD"
+
+        second = nvimgcodec.CodeStream(fpath, bitstream_offset=second_ifd_offset)
+
+        assert second.ifd_offset == second_ifd_offset
+        assert second.next_ifd_offset is not None
+        assert second.next_ifd_offset != second.ifd_offset
+
+    def test_codestream_accepts_bitstream_offset_zero_as_default(self):
+        """Explicit bitstream_offset=0 is accepted as the default view."""
+        fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
+        root = nvimgcodec.CodeStream(fpath)
+        explicit_default = nvimgcodec.CodeStream(fpath, bitstream_offset=0)
+
+        assert explicit_default.width == root.width
+        assert explicit_default.height == root.height
+
+    def test_get_sub_code_stream_rejects_image_idx_with_bitstream_offset(self):
+        """Test that applying image_idx plus an explicit IFD offset is rejected."""
+        fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
+        cs = nvimgcodec.CodeStream(fpath)
+
+        with t.raises(RuntimeError):
+            cs.get_sub_code_stream(image_idx=1, bitstream_offset=cs.next_ifd_offset)
+
+    def test_get_sub_code_stream_rejects_ambiguous_code_stream_view(self):
+        """Ambiguous TIFF selection is rejected when a CodeStreamView is applied."""
+        fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
+        cs = nvimgcodec.CodeStream(fpath)
+        view = nvimgcodec.CodeStreamView(image_idx=1, bitstream_offset=cs.next_ifd_offset)
+
+        with t.raises(RuntimeError):
+            cs.get_sub_code_stream(view)
+
+    def test_get_sub_code_stream_accepts_bitstream_offset_zero_as_default(self):
+        """Explicit bitstream_offset=0 is accepted as the default child view."""
+        fpath = os.path.join(img_dir_path, MULTI_PAGE_TIFF)
+        cs = nvimgcodec.CodeStream(fpath)
+        sub = cs.get_sub_code_stream(bitstream_offset=0)
+
+        assert sub.width == cs.width
+        assert sub.height == cs.height
+
+    def test_cyclic_root_ifd_chain_num_images_fails(self):
+        """A malformed TIFF root-chain cycle makes num_images fail (cycle detection)
+        rather than looping forever."""
+        cs = nvimgcodec.CodeStream(cyclic_root_ifd_tiff())
+        with t.raises(RuntimeError):
+            _ = cs.num_images
+
+    def test_root_view_does_not_walk_full_root_ifd_chain(self):
+        """Root view is known locally and should not need exact root num_images."""
+        assert nvimgcodec.CodeStream(cyclic_root_ifd_tiff()).view is None
+
+    def test_root_first_image_metadata_does_not_walk_full_root_ifd_chain(self):
+        """First-image metadata should not need exact root num_images."""
+        cs = nvimgcodec.CodeStream(cyclic_root_ifd_tiff())
+
+        assert cs.width == 16
+        assert cs.height == 16
+        with t.raises(RuntimeError):
+            _ = cs.num_images
+
+    def test_offset_view_first_image_is_lazy_on_cyclic_root(self):
+        """A one-image view parses only its IFD, so it succeeds on a cyclic root
+        where the full-chain num_images cannot."""
+        root = nvimgcodec.CodeStream(cyclic_root_ifd_tiff())
+        first = root.get_sub_code_stream(0)
+
+        assert first.num_images == 1
+        assert first.width == 16
+        assert first.height == 16
+        assert first.ifd_offset == 8
+        # next_ifd_offset is the raw stored pointer (here the self-cycle):
+        # it is read, not followed, so it does not trip cycle detection.
+        assert first.next_ifd_offset == first.ifd_offset
+
+        # Walking the full chain is the operation that fails on the cycle.
+        with t.raises(RuntimeError):
+            _ = root.num_images
+
+    def test_root_offset_fields_walk_full_root_ifd_chain(self):
+        """Root-level ifd_offset/next_ifd_offset/subifd_offsets go through the full
+        root walk (to report the true num_images), unlike width/height, so they fail
+        on a cyclic root."""
+        # width/height stay lazy (resolved through an image-0 view) and succeed.
+        assert nvimgcodec.CodeStream(cyclic_root_ifd_tiff()).width == 16
+
+        # The offset/SubIFD properties on the root walk the chain and fail.
+        for attr in ("ifd_offset", "next_ifd_offset", "subifd_offsets"):
+            root = nvimgcodec.CodeStream(cyclic_root_ifd_tiff())
+            with t.raises(RuntimeError):
+                _ = getattr(root, attr)
+
+    def test_image_idx_parses_only_up_to_requested_index(self):
+        """image_idx=k walks only to IFD k. With a cycle past the last valid IFD,
+        reaching any index in [0, num_ifds) succeeds, while num_images (the full
+        walk) and an out-of-range index follow the cyclic tail and fail."""
+        num_ifds = 3
+        root = nvimgcodec.CodeStream(chained_ifd_tiff(num_ifds, tail="cycle"))
+
+        # Selecting any valid index parses only up to that IFD and succeeds,
+        # without following the (cyclic) tail after the last requested IFD.
+        for k in range(num_ifds):
+            view = root.get_sub_code_stream(image_idx=k)
+            assert view.num_images == 1
+            assert view.width == 16 and view.height == 16
+
+        # Going past the last valid IFD follows the cyclic tail and fails.
+        with t.raises(RuntimeError):
+            _ = root.get_sub_code_stream(image_idx=num_ifds).width
+        with t.raises(RuntimeError):
+            _ = root.num_images
+
+
+def test_non_tiff_invalid_image_idx_fails_at_substream_creation():
+    """Image-indexed substream creation should reject invalid single-image indexes."""
+    fpath = os.path.join(img_dir_path, JPEG_PATH)
+    cs = nvimgcodec.CodeStream(fpath)
+
+    with t.raises(RuntimeError):
+        cs.get_sub_code_stream(image_idx=1)

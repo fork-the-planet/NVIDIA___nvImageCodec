@@ -90,8 +90,6 @@ class ImageGenericDecoder : public ImageGenericCodec<ImageGenericDecoder, IImage
     bool allocateTempBuffers(Entry& sample, int tid);
     void copyToOutputBuffer(const nvimgcodecImageInfo_t& output_info, const nvimgcodecImageInfo_t& info, int tid);
 
-    const nvimgcodecDecodeParams_t* curr_params_ = nullptr;
-
     // to sort
     std::vector<uint8_t> subsampling_score_;
     std::vector<uint64_t> area_;

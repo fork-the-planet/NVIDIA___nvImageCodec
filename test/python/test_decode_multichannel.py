@@ -51,6 +51,7 @@ def test_decode_single_multichannel(path, shape, dtype, expected_sample_format_f
     assert img_RGB.shape == expected_shape_rgb
     assert img_RGB.dtype == np.uint8
     assert img_RGB.sample_format == nvimgcodec.SampleFormat.I_RGB
+    assert img_RGB.num_channels == 3
 
     # Using UNCHANGED
     params_unchanged = nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.UNCHANGED, allow_any_depth=True)
@@ -58,6 +59,7 @@ def test_decode_single_multichannel(path, shape, dtype, expected_sample_format_f
     assert img_unchanged.shape == shape
     assert img_unchanged.dtype == dtype
     assert img_unchanged.sample_format == expected_sample_format_for_unchanged
+    assert img_unchanged.num_channels == shape[2]
 
     # Gray
     params_gray = nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.GRAY)
@@ -66,3 +68,4 @@ def test_decode_single_multichannel(path, shape, dtype, expected_sample_format_f
     assert img_gray.shape == expected_shape_gray
     assert img_gray.dtype == np.uint8
     assert img_gray.sample_format == nvimgcodec.SampleFormat.I_Y
+    assert img_gray.num_channels == 1

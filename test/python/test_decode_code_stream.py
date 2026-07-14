@@ -19,8 +19,7 @@ import os
 import numpy as np
 from nvidia import nvimgcodec
 import pytest as t
-from utils import img_dir_path
-import nvjpeg_test_speedup
+from utils import img_dir_path, get_nvjpeg_ver, NVJPEG_WITH_FIXED_UPSAMPLING_VERSION
 
 try:
     import cupy as cp
@@ -31,12 +30,21 @@ except:
     CUPY_AVAILABLE = False
     cp = None  # Define cp as None so it can be referenced in parametrize decorators
 
+# if there are problems detecting nvJPEG version, use the stricter test
+SKIP_NVJPEG_ROI_EDGE_COMPARISON = get_nvjpeg_ver() != (0,0,0) and get_nvjpeg_ver() < NVJPEG_WITH_FIXED_UPSAMPLING_VERSION
+
 filenames = [
     "jpeg/padlock-406986_640_420.jpg",
     "jpeg/padlock-406986_640_422.jpg",
     "jpeg/padlock-406986_640_440.jpg",
     "jpeg2k/cat-111793_640.jp2",
 ]
+
+def assert_close_roi_nvjpeg(decoded, ref):
+    if SKIP_NVJPEG_ROI_EDGE_COMPARISON:
+        np.testing.assert_allclose(decoded[1:-1, 1:-1], ref[1:-1, 1:-1])
+    else:
+        np.testing.assert_allclose(decoded, ref)
 
 def test_decode_single_file():
     decoder = nvimgcodec.Decoder()
@@ -59,7 +67,7 @@ def test_decode_single_file():
             np.testing.assert_allclose(imgs[0].cpu(), img.cpu())
 
 def test_decode_roi():
-    decoder = nvimgcodec.Decoder()
+    decoder = nvimgcodec.Decoder(options=":enable_roi_fancy_upsampling=1")
     fpath = os.path.join(img_dir_path, filenames[0])
     raw_bytes = open(fpath, 'rb').read()
     np_arr = np.fromfile(fpath, dtype=np.uint8)
@@ -76,9 +84,9 @@ def test_decode_roi():
         code_stream1.get_sub_code_stream(region = roi),
         code_stream2.get_sub_code_stream(region = roi),
     ]
-    imgs_roi = [decoder.decode(src).cpu() for src in dec_srcs]
+    imgs_roi = [np.array(decoder.decode(src).cpu()) for src in dec_srcs]
     for img in imgs_roi:
-        np.testing.assert_allclose(img, imgref[roi.start[0]:roi.end[0], roi.start[1]:roi.end[1]])
+        assert_close_roi_nvjpeg(img, imgref[roi.start[0]:roi.end[0], roi.start[1]:roi.end[1]])
 
 def test_decode_batch():
     decoder = nvimgcodec.Decoder()
@@ -104,7 +112,7 @@ def test_decode_batch():
         np.testing.assert_allclose(img0, img1)
 
 def test_decode_batch_roi():
-    decoder = nvimgcodec.Decoder()
+    decoder = nvimgcodec.Decoder(options=":enable_roi_fancy_upsampling=1")
     fpaths = [os.path.join(img_dir_path, f) for f in filenames]
     code_streams = [nvimgcodec.CodeStream(fpath) for fpath in fpaths]
     rois = [
@@ -119,8 +127,11 @@ def test_decode_batch_roi():
     imgs = [np.array(img.cpu()) for img in decoder.decode(code_streams)]
     imgs_roi = [np.array(img.cpu()) for img in decoder.decode(dec_srcs)]
 
-    for img, img_roi, roi in zip(imgs, imgs_roi, rois):
-        np.testing.assert_allclose(img_roi, img[roi.start[0]:roi.end[0], roi.start[1]:roi.end[1]])
+    for img, img_roi, roi, filename in zip(imgs, imgs_roi, rois, filenames):
+        if ".jpg" in filename:
+            assert_close_roi_nvjpeg(img_roi, img[roi.start[0]:roi.end[0], roi.start[1]:roi.end[1]])
+        else:
+            np.testing.assert_allclose(img_roi, img[roi.start[0]:roi.end[0], roi.start[1]:roi.end[1]])
 
 @t.mark.parametrize("fname", ["jpeg/padlock-406986_640_440.jpg",
                               "jpeg2k/cat-111793_640.jp2"])
@@ -488,3 +499,155 @@ def test_decode_keep_alive_check():
         assert ref is not None
         assert img.shape == ref.shape
         np.testing.assert_allclose(img.cpu(), ref.cpu())
+
+
+# ----------------------------------------------------------------------
+# Image-reuse tests where the original buffer carries a different
+# precision than the bitstream subsequently decoded into it. The reused
+# Image's .precision must reflect the new bitstream, not the buffer's
+# previous tag.
+# ----------------------------------------------------------------------
+
+@t.mark.parametrize(
+    "first_file, first_precision, second_file, second_precision",
+    [
+        # 8-bit JPEG buffer reused for 12-bit JPEG 2000 (precision must move 8 -> 12)
+        ("jpeg/padlock-406986_640_440.jpg", 8,
+         "jpeg2k/cat-1245673_640-12bit.jp2", 12),
+        # 12-bit J2K buffer reused for 8-bit JPEG (precision must move 12 -> 8)
+        ("jpeg2k/cat-1245673_640-12bit.jp2", 12,
+         "jpeg/padlock-406986_640_440.jpg", 8),
+        # 16-bit J2K buffer reused for 5-bit J2K (precision must move 16 -> 5,
+        # crossing dtype boundary uint16 -> uint8)
+        ("jpeg2k/cat-111793_640-16bit.jp2", 16,
+         "jpeg2k/cat-1245673_640-5bit.jp2", 5),
+        # 5-bit J2K buffer reused for 16-bit J2K (reverse of the above)
+        ("jpeg2k/cat-1245673_640-5bit.jp2", 5,
+         "jpeg2k/cat-111793_640-16bit.jp2", 16),
+        # 12-bit -> 16-bit (precision change without dtype change)
+        ("jpeg2k/cat-1245673_640-12bit.jp2", 12,
+         "jpeg2k/cat-111793_640-16bit.jp2", 16),
+    ]
+)
+def test_decode_reuse_updates_precision_for_new_image(
+    first_file, first_precision, second_file, second_precision):
+    """Decoding a new bitstream into an existing Image must overwrite the
+    Image's precision to match the new bitstream, regardless of what the
+    buffer was originally tagged with."""
+    decoder = nvimgcodec.Decoder()
+    decode_params = nvimgcodec.DecodeParams(
+        color_spec=nvimgcodec.ColorSpec.UNCHANGED, allow_any_depth=True)
+
+    first_stream = nvimgcodec.CodeStream(os.path.join(img_dir_path, first_file))
+    img = decoder.decode(first_stream, params=decode_params)
+    assert img is not None
+    assert img.precision == first_precision, (
+        f"sanity: first decode of {first_file} should report precision "
+        f"{first_precision}, got {img.precision}")
+
+    second_stream = nvimgcodec.CodeStream(os.path.join(img_dir_path, second_file))
+    reused = decoder.decode(second_stream, image=img, params=decode_params)
+    assert reused is img, "decode(image=...) should return the reused object"
+    assert reused.precision == second_precision, (
+        f"after reusing for {second_file}, expected precision "
+        f"{second_precision}, got {reused.precision}")
+
+
+def test_decode_reuse_precision_matches_fresh_decode():
+    """The precision of a reused Image after a new decode must equal the
+    precision of a fresh decode of the same bitstream."""
+    decoder = nvimgcodec.Decoder()
+    decode_params = nvimgcodec.DecodeParams(
+        color_spec=nvimgcodec.ColorSpec.UNCHANGED, allow_any_depth=True)
+
+    seed_stream = nvimgcodec.CodeStream(
+        os.path.join(img_dir_path, "jpeg/padlock-406986_640_440.jpg"))
+    target_stream = nvimgcodec.CodeStream(
+        os.path.join(img_dir_path, "jpeg2k/cat-1245673_640-12bit.jp2"))
+
+    fresh = decoder.decode(target_stream, params=decode_params)
+    seed = decoder.decode(seed_stream, params=decode_params)
+    reused = decoder.decode(target_stream, image=seed, params=decode_params)
+
+    assert reused is seed
+    assert reused.precision == fresh.precision
+    assert reused.dtype == fresh.dtype
+    assert reused.shape == fresh.shape
+
+
+@t.mark.parametrize(
+    "seed_dtype, seed_precision, target_file, target_precision, target_dtype",
+    [
+        # Same dtype, both with lower-than-full precision:
+        (np.uint16, 10, "jpeg2k/cat-1245673_640-12bit.jp2", 12, np.uint16),
+        (np.uint16, 12, "jpeg2k/cat-111793_640-16bit.jp2", 16, np.uint16),
+        (np.uint8, 3, "jpeg2k/cat-1245673_640-5bit.jp2", 5, np.uint8),
+        # Different dtype: wider seed buffer reinterpreted as a narrower target dtype.
+        (np.uint16, 12, "jpeg2k/cat-1245673_640-5bit.jp2", 5, np.uint8),
+        (np.uint16, 10, "jpeg/padlock-406986_640_440.jpg", 8, np.uint8),
+    ]
+)
+def test_decode_reuse_from_artificial_lower_precision_image(
+    seed_dtype, seed_precision, target_file, target_precision, target_dtype):
+    """A seed Image is created via as_image() with an explicit lower precision and a
+    dtype that may differ from the target bitstream. After decoding the target into
+    the seed, .precision and .dtype must reflect the bitstream, not the seed's tags."""
+    target_path = os.path.join(img_dir_path, target_file)
+    decoder = nvimgcodec.Decoder()
+    decode_params = nvimgcodec.DecodeParams(
+        color_spec=nvimgcodec.ColorSpec.UNCHANGED, allow_any_depth=True)
+
+    target_stream = nvimgcodec.CodeStream(target_path)
+    # Size the seed buffer to match the target's resolution. When seed_dtype is wider
+    # than target_dtype, the external-buffer reuse path checks total byte size, so the
+    # uint16 seed has enough capacity for a uint8 target of the same shape.
+    seed_shape = (target_stream.height, target_stream.width, 3)
+    arr = np.zeros(seed_shape, dtype=seed_dtype)
+    seed_img = nvimgcodec.as_image(arr, precision=seed_precision)
+    assert seed_img.precision == seed_precision
+
+    reused = decoder.decode(target_stream, image=seed_img, params=decode_params)
+    assert reused is seed_img, "decode(image=...) should return the reused object"
+    assert reused.precision == target_precision, (
+        f"after decoding {target_file} into a seed with precision={seed_precision} "
+        f"({seed_dtype.__name__}), expected precision {target_precision}, got {reused.precision}")
+    assert np.dtype(reused.dtype) == np.dtype(target_dtype), (
+        f"dtype expected {target_dtype.__name__}, got {reused.dtype}")
+
+    # Pixel-level cross-check against a fresh decode of the same bitstream.
+    fresh = decoder.decode(target_stream, params=decode_params)
+    np.testing.assert_array_equal(np.asarray(reused.cpu()), np.asarray(fresh.cpu()))
+
+
+@t.mark.parametrize(
+    "first_file, second_file, second_precision",
+    [
+        ("jpeg/padlock-406986_640_440.jpg",
+         "jpeg2k/cat-1245673_640-12bit.jp2", 12),
+        ("jpeg2k/cat-1245673_640-12bit.jp2",
+         "jpeg/padlock-406986_640_440.jpg", 8),
+    ]
+)
+def test_decode_reuse_batch_updates_precision(first_file, second_file, second_precision):
+    """Batch variant: reusing a list of Images for a list of different-precision
+    streams must update each Image's precision independently."""
+    decoder = nvimgcodec.Decoder()
+    decode_params = nvimgcodec.DecodeParams(
+        color_spec=nvimgcodec.ColorSpec.UNCHANGED, allow_any_depth=True)
+
+    first_streams = [
+        nvimgcodec.CodeStream(os.path.join(img_dir_path, first_file)),
+        nvimgcodec.CodeStream(os.path.join(img_dir_path, first_file)),
+    ]
+    second_streams = [
+        nvimgcodec.CodeStream(os.path.join(img_dir_path, second_file)),
+        nvimgcodec.CodeStream(os.path.join(img_dir_path, second_file)),
+    ]
+
+    seed_imgs = decoder.decode(first_streams, params=decode_params)
+    assert all(img is not None for img in seed_imgs)
+
+    reused_imgs = decoder.decode(second_streams, images=seed_imgs, params=decode_params)
+    for seed, reused in zip(seed_imgs, reused_imgs):
+        assert reused is seed
+        assert reused.precision == second_precision

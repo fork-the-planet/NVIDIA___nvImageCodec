@@ -24,6 +24,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include "imgproc/convert.h"
+#include "imgproc/image_info_checks.h"
 #include "error_handling.h"
 #include "log.h"
 #include "nvimgcodec.h"
@@ -186,12 +187,10 @@ nvimgcodecProcessingStatus_t EncoderImpl::canEncode(const nvimgcodecCodeStreamDe
             status |= NVIMGCODEC_PROCESSING_STATUS_NUM_PLANES_UNSUPPORTED;
         }
 
-        auto sample_type = info.plane_info[0].sample_type;
-        for (size_t p = 1; p < info.num_planes; p++) {
-            if (info.plane_info[p].sample_type != sample_type) {
-                status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
-            }
+        if (!nvimgcodec::check_planes_consistency(framework_, plugin_id_, info)) {
+            status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
         }
+        auto sample_type = info.plane_info[0].sample_type;
 
         // Check for tile geometry - OpenCV encoder does not support tiling
         nvimgcodecTileGeometryInfo_t* tile_geometry = static_cast<nvimgcodecTileGeometryInfo_t*>(params->struct_next);
@@ -292,6 +291,8 @@ nvimgcodecStatus_t EncoderImpl::encode(const nvimgcodecCodeStreamDesc_t* code_st
             image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_FAIL);
             return ret;
         }
+
+        nvimgcodec::warn_if_custom_precision_unsupported(framework_, plugin_id_, source_image_info);
 
         nvimgcodecJpegImageInfo_t out_jpeg_image_info{NVIMGCODEC_STRUCTURE_TYPE_JPEG_IMAGE_INFO, sizeof(nvimgcodecJpegImageInfo_t), 0};
         nvimgcodecImageInfo_t out_image_info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), &out_jpeg_image_info};

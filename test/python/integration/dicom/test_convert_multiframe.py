@@ -22,7 +22,7 @@ pytest.importorskip("highdicom", reason="highdicom required for enhanced multi-f
 pytest.importorskip("pylibjpeg", reason="pylibjpeg required for enhanced multi-frame conversion tests")
 
 import pydicom
-import pydicom.data
+import pydicom.examples
 
 from nvidia.nvimgcodec.tools.dicom.convert_multiframe import convert_to_enhanced_dicom
 
@@ -81,14 +81,15 @@ def modify_series_attributes(series, **kwargs):
 def ct_series():
     """Create fresh test datasets for each test to avoid pollution."""
     # Create a series of CT slices with different Z positions
-    source_file = pydicom.data.get_testdata_file("693_UNCI.dcm")
-    ds_base = pydicom.dcmread(source_file)
+    # Use pydicom's bundled sample to avoid fetching remote test data.
+    source_file = pydicom.examples.get_path("ct")
+    ds_base = pydicom.dcmread(str(source_file))
     
     series = []
     for i in range(5):
         ds = copy.deepcopy(ds_base)
         # Modify each frame so that the pixel values are different
-        # (add i to all pixels, which is safe for 693_UNCI.dcm's pixel range)
+        # (add i to all pixels, which is safe for the bundled CT sample's pixel range)
         ds.PixelData = (ds.pixel_array + i).astype(ds.pixel_array.dtype).tobytes()
         # Set required attributes for enhanced conversion
         ds.Modality = "CT"
@@ -553,6 +554,8 @@ def test_series_with_mixed_transfer_syntaxes_handled(ct_series):
         else:
             # Returned as individual frames - verify all present
             assert len(result) == len(mixed_series)
+    except AssertionError:
+        raise
     except Exception as e:
         # If it fails, should be a clear error message
         assert "transfer syntax" in str(e).lower(), \

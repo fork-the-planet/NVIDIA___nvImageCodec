@@ -27,6 +27,7 @@
 
 #include "nvimgcodec_tests.h"
 #include "common.h"
+#include "common_ext_encoder_test.h"
 #include "parsers/bmp.h"
 
 using ::testing::Bool;
@@ -268,5 +269,45 @@ INSTANTIATE_TEST_SUITE_P(NVBMP_ENCODE_INVALID_QUALITY,
         Values(NVIMGCODEC_PROCESSING_STATUS_QUALITY_TYPE_UNSUPPORTED)
     )
 );
+
+// ---------------------------------------------------------------------------
+// Strided encode->decode round-trip via the shared CommonExtEncoderTest harness.
+// One test case per input plane-stride layout (contiguous / same padding /
+// different padding per plane), exercising the nvbmp encoder's strided-input
+// handling.
+// ---------------------------------------------------------------------------
+class NvbmpExtEncodeDecodeStrideTest :
+    public CommonExtEncoderTest,
+    public TestWithParam<nvimgcodecSampleFormat_t>
+{
+  public:
+    void SetUp() override
+    {
+        CommonExtEncoderTest::SetUp();
+
+        nvimgcodecExtensionDesc_t bmp_parser_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_bmp_parser_extension_desc(&bmp_parser_desc));
+        extensions_.emplace_back();
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &bmp_parser_desc));
+
+        nvimgcodecExtensionDesc_t nvbmp_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_nvbmp_extension_desc(&nvbmp_desc));
+        extensions_.emplace_back();
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &nvbmp_desc));
+
+        color_spec_ = NVIMGCODEC_COLORSPEC_SRGB;
+        sample_format_ = GetParam();
+        chroma_subsampling_ = NVIMGCODEC_SAMPLING_NONE;
+
+        CommonExtEncoderTest::CreateDecoderAndEncoder();
+    }
+
+    void TearDown() override { CommonExtEncoderTest::TearDown(); }
+};
+
+DEFINE_ENCODE_DECODE_STRIDE_TESTS_FOR_CODEC(NvbmpExtEncodeDecodeStrideTest, "bmp", false)
+
+INSTANTIATE_TEST_SUITE_P(NVBMP_ENCODE_DECODE_STRIDED, NvbmpExtEncodeDecodeStrideTest,
+    Values(NVIMGCODEC_SAMPLEFORMAT_I_RGB, NVIMGCODEC_SAMPLEFORMAT_P_RGB));
 
 }} // namespace nvimgcodec::test

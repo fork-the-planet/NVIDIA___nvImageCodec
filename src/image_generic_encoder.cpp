@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 #include "image_generic_encoder.h"
-#include <imgproc/device_guard.h>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -33,6 +32,7 @@
 #include "iimage.h"
 #include "iimage_encoder.h"
 #include "iimage_encoder_factory.h"
+#include "imgproc/copy_image.h"
 #include "imgproc/exception.h"
 #include "imgproc/type_utils.h"
 #include "log.h"
@@ -45,8 +45,7 @@ void ImageGenericEncoder::canEncode(const std::vector<IImage*>& images, const st
     const nvimgcodecEncodeParams_t* params, nvimgcodecProcessingStatus_t* processing_status, int force_format) noexcept
 {
     try {
-        curr_params_ = params;
-        canProcess(code_streams, images, processing_status, force_format);
+        canProcess(code_streams, images, processing_status, force_format, params);
     } catch (const std::exception& e) {
         NVIMGCODEC_LOG_ERROR(logger_, "Exception during canEncode: " << e.what());
         std::fill(processing_status, processing_status + code_streams.size(), NVIMGCODEC_PROCESSING_STATUS_FAIL);
@@ -57,16 +56,19 @@ ProcessingResultsPromise::FutureImpl ImageGenericEncoder::encode(
     const std::vector<IImage*>& images, const std::vector<ICodeStream*>& code_streams, const nvimgcodecEncodeParams_t* params) noexcept
 {
     try {
-        curr_params_ = params;
-        return process(code_streams, images);
+        return process(code_streams, images, params);
     } catch (const std::exception& e) {
         NVIMGCODEC_LOG_ERROR(logger_, "Exception during encode: " << e.what());
-        auto promise = std::make_shared<ProcessingResultsPromise>(code_streams.size());
-        for (size_t i = 0; i < code_streams.size(); i++) {
-            promise->set(i, ProcessingResult::failure(NVIMGCODEC_PROCESSING_STATUS_FAIL));
-        }
-        return promise->getFuture();
+    } catch (...) {
+        NVIMGCODEC_LOG_ERROR(logger_, "Unknown exception during encode");
     }
+
+    ProcessingResultsPromise promise(static_cast<int>(code_streams.size()));
+    for (size_t i = 0; i < code_streams.size(); i++) {
+        // coverity[fun_call_w_exception : FALSE]
+        promise.set(i, ProcessingResult::failure(NVIMGCODEC_PROCESSING_STATUS_FAIL));
+    }
+    return promise.getFuture();
 }
 
 nvimgcodecProcessingStatus_t ImageGenericEncoder::canProcessImpl(Entry& sample, ProcessorEntry* processor, int tid) noexcept
@@ -75,7 +77,8 @@ nvimgcodecProcessingStatus_t ImageGenericEncoder::canProcessImpl(Entry& sample, 
     nvimgcodecProcessingStatus_t status;
     try {
         sample.processor->instance_->canEncode(
-            sample.code_stream->getCodeStreamDesc(), sample.getImageDesc(), curr_params_, &status, tid);
+            sample.code_stream->getCodeStreamDesc(), sample.getImageDesc(),
+            static_cast<const nvimgcodecEncodeParams_t*>(sample.params), &status, tid);
         NVIMGCODEC_LOG_DEBUG(
             this->logger_, tid << ": " << sample.processor->id_ << " canEncode #" << sample.sample_idx << " returned " << status);
         return status;
@@ -90,7 +93,8 @@ bool ImageGenericEncoder::processImpl(Entry& sample, int tid) noexcept
     try {
         copyToTempBuffers(sample, tid);
         bool encode_ret = sample.processor->instance_->encode(
-            sample.code_stream->getCodeStreamDesc(), sample.getImageDesc(), curr_params_, &sample.status, tid);
+            sample.code_stream->getCodeStreamDesc(), sample.getImageDesc(),
+            static_cast<const nvimgcodecEncodeParams_t*>(sample.params), &sample.status, tid);
 
         assert(sample.status != NVIMGCODEC_PROCESSING_STATUS_UNKNOWN);
         bool encode_success = encode_ret && sample.status == NVIMGCODEC_PROCESSING_STATUS_SUCCESS;
@@ -139,17 +143,6 @@ bool ImageGenericEncoder::copyToTempBuffers(Entry& sample, int tid)
         plane_info.row_stride = static_cast<size_t>(plane_info.width) * bpp * plane_info.num_channels;
     }
 
-    // output is always continuous
-    bool is_input_continuous = true;
-    for (unsigned int c = 0; c < input_info.num_planes; ++c) {
-        const auto& plane = input_info.plane_info[c];
-        size_t bpp = plane.sample_type >> 11;
-        if (plane.row_stride != static_cast<size_t>(plane.width) * plane.num_channels * bpp) {
-            is_input_continuous = false;
-            break;
-        }
-    }
-
     assert(num_threads_ + 1 == per_thread_.size());
     assert(tid >= 0 && tid <= static_cast<int>(num_threads_));
     auto& t = per_thread_[tid];
@@ -176,22 +169,11 @@ bool ImageGenericEncoder::copyToTempBuffers(Entry& sample, int tid)
     }
     auto copy_direction = d2h ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
 
-    if (is_input_continuous) {
-        NVIMGCODEC_LOG_DEBUG(logger_, "cudaMemcpyAsync " << (d2h ? "D2H" : "H2D") << " stream=" << output_info.cuda_stream);
-        assert(GetBufferSize(output_info) == GetBufferSize(input_info));
-        CHECK_CUDA(cudaMemcpyAsync(output_info.buffer, input_info.buffer, GetBufferSize(output_info), copy_direction, output_info.cuda_stream));
-    } else {
-        NVIMGCODEC_LOG_DEBUG(logger_, "cudaMemcpy2DAsync " << (d2h ? "D2H" : "H2D") << " stream=" << output_info.cuda_stream);
-        assert(GetImageSize(output_info) == GetImageSize(input_info));
-        size_t bpp = TypeSize(output_info.plane_info[0].sample_type);
-        size_t row_size = static_cast<size_t>(output_info.plane_info[0].width) * output_info.plane_info[0].num_channels * bpp;
-        CHECK_CUDA(cudaMemcpy2DAsync(
-            output_info.buffer, output_info.plane_info[0].row_stride,
-            input_info.buffer, input_info.plane_info[0].row_stride,
-            row_size, output_info.plane_info[0].height,
-            copy_direction, output_info.cuda_stream
-        ));
-    }
+    // output is always continuous (just allocated above); CopyImage collapses to
+    // a single cudaMemcpyAsync when both sides are contiguous and falls back to
+    // per-plane cudaMemcpy2DAsync otherwise.
+    NVIMGCODEC_LOG_DEBUG(logger_, "CopyImage " << (d2h ? "D2H" : "H2D") << " stream=" << output_info.cuda_stream);
+    CopyImage(output_info, input_info, copy_direction, output_info.cuda_stream);
 
     if (d2h) {
         CHECK_CUDA(cudaStreamSynchronize(output_info.cuda_stream));

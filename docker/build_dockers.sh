@@ -1,7 +1,8 @@
 #!/bin/bash -ex
 
-export VERSION=${VERSION:-release_0.8}  # Update version when changing anything in the Dockerfiles
-export TEGRA_VERSION=${TEGRA_VERSION:-25} # Update version when changing anything in the Dockerfile.tegra-aarch64-linux.builder
+export VERSION=${VERSION:-release_0.9.0}  # Update version when changing anything in the Dockerfiles
+export TEGRA_VERSION=${TEGRA_VERSION:-26} # Update version when changing anything in the Dockerfile.tegra-aarch64-linux.builder
+export CONDA_TEST_VERSION=${CONDA_TEST_VERSION:-2} # Update version when changing anything in the Dockerfile.conda-test
 
 SCRIPT_DIR=$(dirname $0)
 source ${SCRIPT_DIR}/config-docker.sh || source ${SCRIPT_DIR}/default-config-docker.sh
@@ -36,14 +37,14 @@ docker buildx build \
     --push \
     .
 
-# CUDA 13.0.0
-export CUDA_130="${REGISTRY_PREFIX}cuda13.0-${ARCH}"
+# CUDA 13.3.0
+export CUDA_133="${REGISTRY_PREFIX}cuda13.3-${ARCH}"
 docker buildx build \
     --cache-to type=inline \
-    --cache-from type=registry,ref=${CUDA_130} \
-    -t ${CUDA_130} -t ${CUDA_130}:v${VERSION} \
-    -f docker/Dockerfile.cuda130.${ARCH}.deps \
-    --platform ${PLATFORM} \
+    --cache-from "type=registry,ref=${CUDA_133}" \
+    -t "${CUDA_133}" -t "${CUDA_133}:v${VERSION}" \
+    -f "docker/Dockerfile.cuda133.${ARCH}.deps" \
+    --platform "${PLATFORM}" \
     --push \
     .
 
@@ -89,15 +90,15 @@ docker buildx build \
     --push \
     .
 
-# GCC 14, CUDA 13.0
-export BUILDER_CUDA_130="${REGISTRY_PREFIX}builder-cuda-13.0-${ARCH}"
+# GCC 14, CUDA 13.3
+export BUILDER_CUDA_133="${REGISTRY_PREFIX}builder-cuda-13.3-${ARCH}"
 docker buildx build \
     --cache-to type=inline \
-    --cache-from type=registry,ref=${BUILDER_CUDA_130} \
-    -t ${BUILDER_CUDA_130} -t ${BUILDER_CUDA_130}:v${VERSION} \
+    --cache-from "type=registry,ref=${BUILDER_CUDA_133}" \
+    -t "${BUILDER_CUDA_133}" -t "${BUILDER_CUDA_133}:v${VERSION}" \
     -f docker/Dockerfile.cuda.deps \
     --build-arg "FROM_IMAGE_NAME=${DEPS_GCC14}:v${VERSION}" \
-    --build-arg "CUDA_IMAGE=${CUDA_130}:v${VERSION}" \
+    --build-arg "CUDA_IMAGE=${CUDA_133}:v${VERSION}" \
     --platform ${PLATFORM} \
     --push \
     .
@@ -153,17 +154,46 @@ EOF
 
 fi
 
-# CUDA 13.0
-export RUNNER_CUDA_130="${REGISTRY_PREFIX}runner-cuda-13.0-${ARCH}-${PYVER}"
+# CUDA 13.3
+export RUNNER_CUDA_133="${REGISTRY_PREFIX}runner-cuda-13.3-${ARCH}-${PYVER}"
 docker buildx build \
     --cache-to type=inline \
-    --cache-from type=registry,ref=${RUNNER_CUDA_130} \
-    -t ${RUNNER_CUDA_130} -t ${RUNNER_CUDA_130}:v${VERSION} \
+    --cache-from "type=registry,ref=${RUNNER_CUDA_133}" \
+    -t "${RUNNER_CUDA_133}" -t "${RUNNER_CUDA_133}:v${VERSION}" \
     -f docker/Dockerfile.${ARCH} \
-    --build-arg "BASE=nvidia/cuda:13.0.0-devel-ubuntu24.04" \
-    --build-arg "VER_CUDA=13.0.0" \
+    --build-arg "BASE=nvidia/cuda:13.3.0-devel-ubuntu24.04" \
+    --build-arg "VER_CUDA=13.3.0" \
     --build-arg "VER_UBUNTU=24.04" \
     --platform ${PLATFORM} \
     --push \
     .
 
+####### CONDA TEST IMAGES #######
+
+if [ "$ARCH" == "x86_64" ]; then
+    # Dockerfile.conda-test has no COPY/ADD, so the build context is irrelevant.
+    # Pipe the Dockerfile via stdin (context arg `-`) to avoid uploading the
+    # entire repo to the Docker daemon on every build.
+
+    # CUDA 12.9
+    export CONDA_TEST_CUDA_129="${REGISTRY_PREFIX}conda-test-cuda-12.9-x86_64"
+    docker buildx build \
+        --cache-to type=inline \
+        --cache-from type=registry,ref=${CONDA_TEST_CUDA_129} \
+        -t ${CONDA_TEST_CUDA_129} -t ${CONDA_TEST_CUDA_129}:conda_test_v${CONDA_TEST_VERSION} \
+        --build-arg "CUDA_VERSION=12.9.0" \
+        --platform "linux/amd64" \
+        --push \
+        - < docker/Dockerfile.conda-test
+
+    # CUDA 13.3
+    export CONDA_TEST_CUDA_133="${REGISTRY_PREFIX}conda-test-cuda-13.3-x86_64"
+    docker buildx build \
+        --cache-to type=inline \
+        --cache-from "type=registry,ref=${CONDA_TEST_CUDA_133}" \
+        -t "${CONDA_TEST_CUDA_133}" -t "${CONDA_TEST_CUDA_133}:conda_test_v${CONDA_TEST_VERSION}" \
+        --build-arg "CUDA_VERSION=13.3.0" \
+        --platform "linux/amd64" \
+        --push \
+        - < docker/Dockerfile.conda-test
+fi

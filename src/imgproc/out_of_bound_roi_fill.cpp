@@ -78,7 +78,12 @@ inline uint32_t get_fill_bits(const nvimgcodecRegion_t& region, uint32_t comp_id
         }
 
         default:
+            // verify_region_fill_support() rejects unsupported sample data types
+            // before we ever reach this path, so the default case is unreachable
+            // in practice. Keep the assert for debug builds and return a defined
+            // sentinel (0) so release builds do not return an indeterminate value.
             assert(false);
+            return 0;
     }
 }
 

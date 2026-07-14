@@ -21,7 +21,7 @@ import pytest as t
 import threading
 import sysconfig
 from nvidia import nvimgcodec
-from utils import get_default_decoder_options, img_dir_path, compare_image
+from utils import img_dir_path, compare_image
 from concurrent.futures import ThreadPoolExecutor
 files = {
     "jpeg" : [
@@ -72,15 +72,14 @@ def test_decode_free_threaded(shared_tmp_path, input_format, image_format, backe
     def decoder():
         if not hasattr(thread_local, "decoder"):
             thread_local.decoder = nvimgcodec.Decoder(
-                max_num_cpu_threads=1, backends=backends, options=get_default_decoder_options())
+                max_num_cpu_threads=1, backends=backends)
         return thread_local.decoder
 
     # A different decoder per thread
     def decoder_ref():
         if not hasattr(thread_local, "decoder_ref"):
             thread_local.decoder_ref = nvimgcodec.Decoder(
-                max_num_cpu_threads=1, backends=[nvimgcodec.BackendKind.CPU_ONLY],
-                options=get_default_decoder_options())
+                max_num_cpu_threads=1, backends=[nvimgcodec.BackendKind.CPU_ONLY])
         return thread_local.decoder_ref
 
     assert input_format == 'path'  # for now

@@ -19,6 +19,7 @@
 #include <nvimgcodec.h>
 #include <string.h>
 #include <vector>
+#include <limits>
 
 #include "imgproc/exception.h"
 #include "exif_orientation.h"
@@ -69,8 +70,14 @@ int ParseInt(nvimgcodecIoStreamDesc_t* io_stream)
     while (true) {
         char c = ReadValue<char>(io_stream);
         pos++;
-        if (isdigit(c))
+        if (isdigit(c)) {
+            if (int_value > (std::numeric_limits<int>::max() - 9) / 10) {
+                throw std::overflow_error(
+                    "Exceed int range when parsing pnm codestream. Already read: " + std::to_string(int_value) + ", next digit is: " + c
+                );
+            }
             int_value = int_value * 10 + (c - '0');
+        }
         else if (c == '#')
             pos += SkipComment(io_stream);
         else
@@ -109,12 +116,18 @@ nvimgcodecStatus_t GetImageInfoImpl(const char* plugin_id, const nvimgcodecFrame
     // formats "P3" and "P6" are RGB color, all other formats are bitmaps or greymaps
     uint32_t nchannels = (header[1] == '3' || header[1] == '6') ? 3 : 1;
 
-    SkipSpaces(io_stream);
-    uint32_t width = ParseInt(io_stream);
-    SkipSpaces(io_stream);
-    uint32_t height = ParseInt(io_stream);
-    SkipSpaces(io_stream);
-    uint32_t max_value = ParseInt(io_stream);
+    uint32_t width, height, max_value;
+    try {
+        SkipSpaces(io_stream);
+        width = ParseInt(io_stream);
+        SkipSpaces(io_stream);
+        height = ParseInt(io_stream);
+        SkipSpaces(io_stream);
+        max_value = ParseInt(io_stream);
+    } catch ( std::overflow_error const& ex) {
+        NVIMGCODEC_LOG_ERROR(framework, plugin_id, ex.what());
+        return NVIMGCODEC_STATUS_BAD_CODESTREAM;
+    }
 
     image_info->sample_format = nchannels >= 3 ? NVIMGCODEC_SAMPLEFORMAT_P_RGB : NVIMGCODEC_SAMPLEFORMAT_P_Y;
     image_info->orientation = {NVIMGCODEC_STRUCTURE_TYPE_ORIENTATION, sizeof(nvimgcodecOrientation_t), nullptr, 0, false, false};

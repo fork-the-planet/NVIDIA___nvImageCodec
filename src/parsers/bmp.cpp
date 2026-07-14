@@ -41,14 +41,14 @@ enum BmpCompressionType
 struct BitmapCoreHeader
 {
     uint32_t header_size;
-    uint16_t width, heigth, planes, bpp;
+    uint16_t width, height, planes, bpp;
 };
 static_assert(sizeof(BitmapCoreHeader) == 12);
 
 struct BitmapInfoHeader
 {
     int32_t header_size;
-    int32_t width, heigth;
+    int32_t width, height;
     uint16_t planes, bpp;
     uint32_t compression, image_size;
     int32_t x_pixels_per_meter, y_pixels_per_meter;
@@ -256,7 +256,7 @@ nvimgcodecStatus_t BMPParserPlugin::Parser::getImageInfo(nvimgcodecImageInfo_t* 
         if (length >= 26 && header_size == 12) {
             BitmapCoreHeader header = ReadValue<BitmapCoreHeader>(io_stream);
             image_info->plane_info[0].width = header.width;
-            image_info->plane_info[0].height = header.heigth;
+            image_info->plane_info[0].height = header.height;
             bpp = header.bpp;
             if (bpp <= 8) {
                 io_stream->tell(io_stream->instance, &palette_start);
@@ -266,8 +266,9 @@ nvimgcodecStatus_t BMPParserPlugin::Parser::getImageInfo(nvimgcodecImageInfo_t* 
         } else if (length >= 50 && header_size >= 40) {
             BitmapInfoHeader header = ReadValue<BitmapInfoHeader>(io_stream);
             io_stream->skip(io_stream->instance, header_size - sizeof(header)); // Skip the ignored part of header
-            image_info->plane_info[0].width = abs(header.width);
-            image_info->plane_info[0].height = abs(header.heigth);
+            // cast to int64_t to prevent overflow when computing abs(INT_MIN)
+            image_info->plane_info[0].width = std::abs(static_cast<int64_t>(header.width));
+            image_info->plane_info[0].height = std::abs(static_cast<int64_t>(header.height));
             bpp = header.bpp;
             compression_type = header.compression;
             ncolors = header.colors_used;

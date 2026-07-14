@@ -37,6 +37,9 @@
 #if defined(BUILD_NVJPEG_EXT)
 #  include <extensions/nvjpeg/nvjpeg_ext.h>
 #endif
+#if defined(BUILD_OPENCV_EXT)
+#  include <extensions/opencv/opencv_ext.h>
+#endif
 #include <parsers/jpeg.h>
 #include "imgproc/device_buffer.h"
 #include "imgproc/pinned_buffer.h"
@@ -121,9 +124,7 @@ struct CpuTraits {
     static constexpr const nvimgcodecBackend_t* kBackends = nullptr;
 };
 
-// Use only the software CUDA decoder (HYBRID_CPU_GPU) to get reproducible pixel output.
-// The hardware JPEG engine (HW_GPU_ONLY) may produce slightly different results across
-// concurrent invocations, causing non-deterministic pixel mismatches in correctness tests.
+// Pin nvjpeg to the Hybrid CPU GPU backend to get reproducible results.
 static const nvimgcodecBackend_t kHybridBackend = {
     NVIMGCODEC_STRUCTURE_TYPE_BACKEND, sizeof(nvimgcodecBackend_t), nullptr,
     NVIMGCODEC_BACKEND_KIND_HYBRID_CPU_GPU,
@@ -419,6 +420,119 @@ TYPED_TEST(ConcurrentDecodeTest, concurrent_threads)
         EXPECT_EQ(refs[i], entries[i].buf.host_bytes()) << "pixel mismatch for " << kImages[i];
         this->Destroy(entries[i]);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-submission decoder params regression: back-to-back decodes with
+// different apply_exif_orientation must not stomp each other's params.
+// ---------------------------------------------------------------------------
+
+TYPED_TEST(ConcurrentDecodeTest, back_to_back_different_exif_no_stomp)
+{
+    const std::string path = resources_dir + "/jpeg/exif/padlock-406986_640_rotate_90.jpg";
+    constexpr int kBatch = 8;
+
+    // libjpeg_turbo doesn't apply EXIF orientation (returns
+    // ORIENTATION_UNSUPPORTED). Register opencv as a fallback so the CpuTraits
+    // path can decode EXIF-rotated JPEGs. Without opencv, the CpuTraits variant
+    // can't produce a rotated reference at all, so skip it — otherwise both
+    // refs would match and ASSERT_NE below would fire for configuration
+    // reasons rather than for the actual race.
+#if defined(BUILD_OPENCV_EXT)
+    ASSERT_NO_FATAL_FAILURE(RegisterExt(this->instance_, this->exts_, get_opencv_extension_desc));
+#else
+    if constexpr (TypeParam::kKind == NVIMGCODEC_IMAGE_BUFFER_KIND_STRIDED_HOST) {
+        GTEST_SKIP() << "CpuTraits EXIF-orientation coverage requires BUILD_OPENCV_EXT";
+    }
+#endif
+
+    // Build references.
+    nvimgcodecDecodeParams_t p_rotated  {NVIMGCODEC_STRUCTURE_TYPE_DECODE_PARAMS, sizeof(p_rotated),  0};
+    p_rotated.apply_exif_orientation = 1;
+    nvimgcodecDecodeParams_t p_unrotated{NVIMGCODEC_STRUCTURE_TYPE_DECODE_PARAMS, sizeof(p_unrotated), 0};
+    p_unrotated.apply_exif_orientation = 0;
+
+    // Use a single-threaded reference decoder (unaffected by the race).
+    nvimgcodecExecutionParams_t ref_ep{NVIMGCODEC_STRUCTURE_TYPE_EXECUTION_PARAMS, sizeof(ref_ep), 0};
+    ref_ep.device_id           = NVIMGCODEC_DEVICE_CURRENT;
+    ref_ep.max_num_cpu_threads = 1;
+    ref_ep.num_backends        = TypeParam::kNumBackends;
+    ref_ep.backends            = TypeParam::kBackends;
+    nvimgcodecDecoder_t ref_dec = nullptr;
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS,
+        nvimgcodecDecoderCreate(this->instance_, &ref_dec, &ref_ep, nullptr));
+
+    typename TestFixture::Entry ref_e_rot, ref_e_unrot;
+    ASSERT_NO_FATAL_FAILURE(this->Prepare(ref_e_rot, path));
+    ASSERT_NO_FATAL_FAILURE(this->Prepare(ref_e_unrot, path));
+
+    nvimgcodecFuture_t f_ref_rot = nullptr, f_ref_unrot = nullptr;
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS,
+        nvimgcodecDecoderDecode(ref_dec, &ref_e_rot.cs, &ref_e_rot.image, 1, &p_rotated, &f_ref_rot));
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecFutureWaitForAll(f_ref_rot));
+    nvimgcodecFutureDestroy(f_ref_rot);
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS,
+        nvimgcodecDecoderDecode(ref_dec, &ref_e_unrot.cs, &ref_e_unrot.image, 1, &p_unrotated, &f_ref_unrot));
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecFutureWaitForAll(f_ref_unrot));
+    nvimgcodecFutureDestroy(f_ref_unrot);
+
+    auto ref_rot   = ref_e_rot.buf.host_bytes();
+    auto ref_unrot = ref_e_unrot.buf.host_bytes();
+    this->Destroy(ref_e_rot);
+    this->Destroy(ref_e_unrot);
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecDecoderDestroy(ref_dec));
+    ASSERT_NE(ref_rot, ref_unrot) << "references must differ — non-identity EXIF expected";
+
+    // Multi-threaded decoder + back-to-back batches with different params.
+    nvimgcodecExecutionParams_t ep{NVIMGCODEC_STRUCTURE_TYPE_EXECUTION_PARAMS, sizeof(ep), 0};
+    ep.device_id           = NVIMGCODEC_DEVICE_CURRENT;
+    ep.max_num_cpu_threads = 4;
+    ep.num_backends        = TypeParam::kNumBackends;
+    ep.backends            = TypeParam::kBackends;
+    nvimgcodecDecoder_t mt_dec = nullptr;
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS,
+        nvimgcodecDecoderCreate(this->instance_, &mt_dec, &ep, nullptr));
+
+    struct Batch {
+        std::vector<typename TestFixture::Entry> entries;
+        std::vector<nvimgcodecCodeStream_t>      cs_ptrs;
+        std::vector<nvimgcodecImage_t>           img_ptrs;
+        nvimgcodecFuture_t                       future = nullptr;
+    };
+    Batch a, b;
+    a.entries.resize(kBatch);
+    b.entries.resize(kBatch);
+    for (int i = 0; i < kBatch; ++i) {
+        ASSERT_NO_FATAL_FAILURE(this->Prepare(a.entries[i], path));
+        ASSERT_NO_FATAL_FAILURE(this->Prepare(b.entries[i], path));
+    }
+    for (auto& e : a.entries) { a.cs_ptrs.push_back(e.cs); a.img_ptrs.push_back(e.image); }
+    for (auto& e : b.entries) { b.cs_ptrs.push_back(e.cs); b.img_ptrs.push_back(e.image); }
+
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS,
+        nvimgcodecDecoderDecode(mt_dec, a.cs_ptrs.data(), a.img_ptrs.data(),
+            kBatch, &p_rotated,   &a.future));
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS,
+        nvimgcodecDecoderDecode(mt_dec, b.cs_ptrs.data(), b.img_ptrs.data(),
+            kBatch, &p_unrotated, &b.future));
+
+    std::vector<nvimgcodecProcessingStatus_t> sa(kBatch, NVIMGCODEC_PROCESSING_STATUS_UNKNOWN);
+    std::vector<nvimgcodecProcessingStatus_t> sb(kBatch, NVIMGCODEC_PROCESSING_STATUS_UNKNOWN);
+    this->WaitAndCheck(a.future, sa.data(), kBatch);
+    this->WaitAndCheck(b.future, sb.data(), kBatch);
+
+    for (int i = 0; i < kBatch; ++i) {
+        EXPECT_EQ(NVIMGCODEC_PROCESSING_STATUS_SUCCESS, sa[i]) << "submit A frame " << i;
+        EXPECT_EQ(NVIMGCODEC_PROCESSING_STATUS_SUCCESS, sb[i]) << "submit B frame " << i;
+        EXPECT_EQ(ref_rot,   a.entries[i].buf.host_bytes())
+            << "submit A frame " << i << " was decoded with the wrong apply_exif_orientation (curr_params_ race)";
+        EXPECT_EQ(ref_unrot, b.entries[i].buf.host_bytes())
+            << "submit B frame " << i << " was decoded with the wrong apply_exif_orientation";
+    }
+
+    for (auto& e : a.entries) this->Destroy(e);
+    for (auto& e : b.entries) this->Destroy(e);
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecDecoderDestroy(mt_dec));
 }
 
 }} // namespace nvimgcodec::test

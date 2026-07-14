@@ -395,6 +395,9 @@ nvimgcodecStatus_t JPEGParserPlugin::Parser::getImageInfo(nvimgcodecImageInfo_t*
                 jpeg_image_info->encoding = static_cast<nvimgcodecJpegEncoding_t>(sof_marker[1]);
         }
 
+    } catch (const UnexpectedEndOfStream& e) {
+        NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Could not retrieve image info from jpeg stream - " << e.what());
+        return NVIMGCODEC_STATUS_BAD_CODESTREAM;
     } catch (const std::runtime_error& e) {
         NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Could not retrieve image info from jpeg stream - " << e.what());
         return NVIMGCODEC_STATUS_EXTENSION_INTERNAL_ERROR;

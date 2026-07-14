@@ -1,11 +1,22 @@
-
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import os
 import functools
 import time
 from pathlib import Path
-
-from tcia_utils import nbia
 
 
 # MIDI-B PHI Detection test / validation data sets.
@@ -33,10 +44,11 @@ DOWNLOAD_RETRY_DELAY_SEC = 5
 def get_all_series():
     """
     Return list of all series from all MIDI-B collections, caching the result.
-    
+
     Returns:
         List of series dictionaries, each containing SeriesInstanceUID and other metadata
     """
+    from tcia_utils import nbia
     all_series = []
     for collection_name in collection_names:
         series = nbia.getSeries(collection=collection_name)
@@ -81,18 +93,17 @@ def download_series(series):
     Returns:
         Path to downloaded zip file, or None if download failed
     """
-    # If series is a string, look it up
     if isinstance(series, str):
         series_uid = series
-        series = get_series_by_uid(series_uid)
-        if series is None:
-            print(f"Series {series_uid} not found in any collection")
-            return None
+        series_data = [series_uid]
+        input_type = "list"
     else:
         series_uid = series.get("SeriesInstanceUID")
         if not series_uid:
             print("Series has no SeriesInstanceUID")
             return None
+        series_data = [series]
+        input_type = ""
 
     out_dir = os.path.join(os.path.dirname(__file__), ".midi_b_data")
     os.makedirs(out_dir, exist_ok=True)
@@ -100,7 +111,8 @@ def download_series(series):
     last_error = None
     for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
         try:
-            nbia.downloadSeries([series], as_zip=True, path=out_dir)
+            from tcia_utils import nbia
+            nbia.downloadSeries(series_data, input_type=input_type, as_zip=True, path=out_dir)
             zip_path = _zip_path_for_series(out_dir, series_uid)
             if zip_path:
                 return zip_path

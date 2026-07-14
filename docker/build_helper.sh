@@ -58,15 +58,49 @@ export EXTRA_CMAKE_OPTIONS=${EXTRA_CMAKE_OPTIONS}
 export BUNDLE_PATH_PREFIX=${BUNDLE_PATH_PREFIX}
 export TEST_BUNDLED_LIBS=${TEST_BUNDLED_LIBS:-YES}
 
-# use all available pythons
+# The JOB_SPEC passes INSTALL_LIB_PREFIX_DIR / INSTALL_LIB_ARCHIVE and
+# INSTALL_TEST_PREFIX_DIR / INSTALL_TEST_ARCHIVE; accept either naming style.
+INSTALL_PREFIX_DIR=${INSTALL_PREFIX_DIR:-${INSTALL_LIB_PREFIX_DIR:-}}
+INSTALL_ARCHIVE=${INSTALL_ARCHIVE:-${INSTALL_LIB_ARCHIVE:-}}
+INSTALL_TEST_PREFIX_DIR=${INSTALL_TEST_PREFIX_DIR:-}
+INSTALL_TEST_ARCHIVE=${INSTALL_TEST_ARCHIVE:-}
+
 export LD_LIBRARY_PATH="${PWD}:${LD_LIBRARY_PATH}"
-export Python_EXECUTABLE=$(which python)
+
+# Pick the interpreter that runs CMake's stub codegen and `setup.py bdist_wheel`.
+# HOST_PYTHON_VERSION is set by the builder Dockerfile (ENV HOST_PYTHON_VERSION=...)
+# and can be overridden at the call site (e.g. HOST_PYTHON_VERSION=3.13 ./build_helper.sh).
+# Falls back to whatever `python` resolves to on PATH for builders that don't bake it in.
+if [ -n "${HOST_PYTHON_VERSION}" ]; then
+    export Python_EXECUTABLE="/usr/bin/python${HOST_PYTHON_VERSION}"
+    if [ ! -x "${Python_EXECUTABLE}" ]; then
+        echo "ERROR: Python_EXECUTABLE=${Python_EXECUTABLE} not found (HOST_PYTHON_VERSION=${HOST_PYTHON_VERSION})" >&2
+        exit 1
+    fi
+else
+    export Python_EXECUTABLE=$(which python)
+fi
+
 export NPROC=$(grep ^processor /proc/cpuinfo | wc -l)
 if [ $NPROC -gt 32 ]; then
     export NPROC=32
 fi
 
+archive_install_prefix() {
+    local archive_path="$1"
+    local prefix_path="$2"
+    local archive_var="$3"
+    local prefix_var="$4"
 
+    if [ -z "${archive_path}" ]; then
+        return
+    fi
+    if [ -z "${prefix_path}" ]; then
+        echo "ERROR: ${archive_var} requires ${prefix_var}" >&2
+        exit 1
+    fi
+    tar -czf "${archive_path}" -C "${prefix_path}" .
+}
 
 cmake ../                                                              \
       -DBUILD_ID=${NVIDIA_BUILD_ID}                                    \
@@ -101,6 +135,24 @@ cmake ../                                                              \
 
 make -j${NPROC}
 
+# When INSTALL_PREFIX_DIR is set, run `cmake --install` so the parent CI/CD
+# pipeline can pick up a fully-staged install tree (lib/, include/, etc.)
+# from a known sibling directory. CI sets this; local invocations leave it
+# unset and skip the install step.
+if [ -n "${INSTALL_PREFIX_DIR}" ]; then
+    cmake --install . --prefix "${INSTALL_PREFIX_DIR}"
+fi
+if [ -n "${INSTALL_LIB_PREFIX_DIR:-}" ]; then
+    cmake --install . --prefix "${INSTALL_LIB_PREFIX_DIR}" --component lib
+fi
+if [ -n "${INSTALL_TEST_PREFIX_DIR:-}" ]; then
+    cmake --install . --prefix "${INSTALL_TEST_PREFIX_DIR}" --component tests
+fi
+
+if [ -n "${INSTALL_TEST_PREFIX_DIR}" ]; then
+    cmake --install . --prefix "${INSTALL_TEST_PREFIX_DIR}" --component tests
+fi
+
 cpack --config CPackConfig.cmake -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
 mkdir -p ${WHL_OUTDIR}
 cp *.tar.gz *.deb ${WHL_OUTDIR}/
@@ -108,6 +160,18 @@ cp *.tar.gz *.deb ${WHL_OUTDIR}/
 if [ "${BUILD_WHEEL}" = "ON" ]; then
     make wheel
     cp python/*.whl ${WHL_OUTDIR}/
+    if [ -n "${INSTALL_PREFIX_DIR}" ]; then
+        mkdir -p ${INSTALL_PREFIX_DIR}/test
+        cp python/*.whl ${INSTALL_PREFIX_DIR}/test/
+    fi
+    if [ -n "${INSTALL_TEST_PREFIX_DIR:-}" ]; then
+        mkdir -p ${INSTALL_TEST_PREFIX_DIR}/test
+        cp python/*.whl ${INSTALL_TEST_PREFIX_DIR}/test/
+    fi
     # TODO(janton): custom bundle path prefix(?)
     # TODO(janton): test bundled libs
 fi
+
+archive_install_prefix "${INSTALL_ARCHIVE:-}" "${INSTALL_PREFIX_DIR:-}" INSTALL_ARCHIVE INSTALL_PREFIX_DIR
+archive_install_prefix "${INSTALL_LIB_ARCHIVE:-}" "${INSTALL_LIB_PREFIX_DIR:-}" INSTALL_LIB_ARCHIVE INSTALL_LIB_PREFIX_DIR
+archive_install_prefix "${INSTALL_TEST_ARCHIVE:-}" "${INSTALL_TEST_PREFIX_DIR:-}" INSTALL_TEST_ARCHIVE INSTALL_TEST_PREFIX_DIR

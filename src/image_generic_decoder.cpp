@@ -33,6 +33,7 @@
 #include "iimage.h"
 #include "iimage_decoder.h"
 #include "iimage_decoder_factory.h"
+#include "imgproc/copy_image.h"
 #include "imgproc/device_guard.h"
 #include "imgproc/exception.h"
 #include "imgproc/type_utils.h"
@@ -47,6 +48,7 @@ nvimgcodecStatus_t ImageGenericDecoder::getMetadata(ICodeStream* code_stream, nv
     nvimgcodecStatus_t ret = NVIMGCODEC_STATUS_IMPLEMENTATION_UNSUPPORTED;
     try {
         NVIMGCODEC_LOG_INFO(logger_, "ImageGenericDecoder::getMetadata");
+        DeviceGuard device_guard(exec_params_.device_id);
         auto codec = code_stream->getCodec();
         auto* processor = initProcessorsAndGetFirstForCodec(codec); 
         
@@ -72,8 +74,7 @@ void ImageGenericDecoder::canDecode(const std::vector<ICodeStream*>& code_stream
     const nvimgcodecDecodeParams_t* params, nvimgcodecProcessingStatus_t* processing_status, int force_format) noexcept
 {
     try {
-        curr_params_ = params;
-        canProcess(code_streams, images, processing_status, force_format);
+        canProcess(code_streams, images, processing_status, force_format, params);
     } catch (const std::exception& e) {
         NVIMGCODEC_LOG_ERROR(logger_, "Exception during canDecode: " << e.what());
         std::fill(processing_status, processing_status + code_streams.size(), NVIMGCODEC_PROCESSING_STATUS_FAIL);
@@ -85,16 +86,19 @@ ProcessingResultsPromise::FutureImpl ImageGenericDecoder::decode(
 {
     try {
         NVIMGCODEC_LOG_INFO(logger_, "ImageGenericDecoder::decode num_samples=" << code_streams.size());
-        curr_params_ = params;
-        return process(code_streams, images);
+        return process(code_streams, images, params);
     } catch (const std::exception& e) {
         NVIMGCODEC_LOG_ERROR(logger_, "Exception during decode: " << e.what());
-        auto promise = std::make_shared<ProcessingResultsPromise>(static_cast<int>(code_streams.size()));
-        for (size_t i = 0; i < code_streams.size(); i++) {
-            promise->set(i, ProcessingResult::failure(NVIMGCODEC_PROCESSING_STATUS_FAIL));
-        }
-        return promise->getFuture();
+    } catch (...) {
+        NVIMGCODEC_LOG_ERROR(logger_, "Unknown exception during decode");
     }
+
+    ProcessingResultsPromise promise(static_cast<int>(code_streams.size()));
+    for (size_t i = 0; i < code_streams.size(); i++) {
+        // coverity[fun_call_w_exception : FALSE]
+        promise.set(i, ProcessingResult::failure(NVIMGCODEC_PROCESSING_STATUS_FAIL));
+    }
+    return promise.getFuture();
 }
 
 void ImageGenericDecoder::sortSamples()
@@ -153,7 +157,8 @@ nvimgcodecProcessingStatus_t ImageGenericDecoder::canProcessImpl(Entry& sample, 
     nvimgcodecProcessingStatus_t status;
     try {
         processor->instance_->canDecode(
-            sample.getImageDesc(), sample.code_stream->getCodeStreamDesc(), curr_params_, &status, tid);
+            sample.getImageDesc(), sample.code_stream->getCodeStreamDesc(),
+            static_cast<const nvimgcodecDecodeParams_t*>(sample.params), &status, tid);
         NVIMGCODEC_LOG_DEBUG(
             this->logger_, tid << ": " << processor->id_ << " canDecode #" << sample.sample_idx << " returned " << status);
         return status;
@@ -168,7 +173,8 @@ bool ImageGenericDecoder::processImpl(Entry& sample, int tid) noexcept
     try {
         sample.should_copy = allocateTempBuffers(sample, tid);
         auto decode_ret =
-            sample.processor->instance_->decode(sample.getImageDesc(), sample.code_stream->getCodeStreamDesc(), curr_params_, tid);
+            sample.processor->instance_->decode(sample.getImageDesc(), sample.code_stream->getCodeStreamDesc(),
+                static_cast<const nvimgcodecDecodeParams_t*>(sample.params), tid);
         assert(sample.status != NVIMGCODEC_PROCESSING_STATUS_UNKNOWN);
         bool decode_success = decode_ret && sample.status == NVIMGCODEC_PROCESSING_STATUS_SUCCESS;
 
@@ -199,8 +205,12 @@ bool ImageGenericDecoder::processBatchImpl(ProcessorEntry& processor) noexcept
         for (auto& sample : batched_processed_) {
             sample->should_copy = allocateTempBuffers(*sample, tid);
         }
+        // All samples in this submission share the same params (set together
+        // in initState()), so any sample carries the correct pointer.
+        assert(!batched_processed_.empty());
+        auto* batch_params = static_cast<const nvimgcodecDecodeParams_t*>(batched_processed_.front()->params);
         auto ret = processor.instance_->decodeBatch(
-            batched_image_descs_.data(), batched_code_stream_descs_.data(), curr_params_, batched_processed_.size(), 0);
+            batched_image_descs_.data(), batched_code_stream_descs_.data(), batch_params, batched_processed_.size(), 0);
         if (ret != NVIMGCODEC_STATUS_SUCCESS)
             return false;
 
@@ -302,33 +312,11 @@ void ImageGenericDecoder::copyToOutputBuffer(const nvimgcodecImageInfo_t& output
     auto& t = per_thread_[tid];
     auto& s = per_stream_[t.stream_idx];
 
-    // input is always continuous (we specify it in that way in allocateTempBuffers())
-    bool is_output_continuous = true;
-    for (unsigned int c = 0; c < output_info.num_planes; ++c) {
-        const auto& plane = output_info.plane_info[c];
-        size_t bpp = TypeSize(plane.sample_type);
-        if (plane.row_stride != static_cast<size_t>(plane.width) * plane.num_channels * bpp) {
-            is_output_continuous = false;
-            break;
-        }
-    }
-
-    if (is_output_continuous) {
-        NVIMGCODEC_LOG_DEBUG(logger_, "cudaMemcpyAsync " << (d2h ? "D2H" : "H2D") << " stream=" << s.stream);
-        assert(GetBufferSize(info) == GetBufferSize(output_info));
-        CHECK_CUDA(cudaMemcpyAsync(output_info.buffer, info.buffer, GetBufferSize(info), copy_direction, s.stream));
-    } else {
-        NVIMGCODEC_LOG_DEBUG(logger_, "cudaMemcpy2DAsync " << (d2h ? "D2H" : "H2D") << " stream=" << s.stream);
-        assert(GetImageSize(info) == GetImageSize(output_info));
-        size_t bpp = TypeSize(info.plane_info[0].sample_type);
-        size_t row_size = static_cast<size_t>(info.plane_info[0].width) * info.plane_info[0].num_channels * bpp;
-        CHECK_CUDA(cudaMemcpy2DAsync(
-            output_info.buffer, output_info.plane_info[0].row_stride,
-            info.buffer, info.plane_info[0].row_stride,
-            row_size, info.plane_info[0].height,
-            copy_direction, s.stream
-        ));
-    }
+    // input is always continuous (we specify it in that way in allocateTempBuffers());
+    // CopyImage collapses to a single cudaMemcpyAsync when both sides are
+    // contiguous and falls back to per-plane cudaMemcpy2DAsync otherwise.
+    NVIMGCODEC_LOG_DEBUG(logger_, "CopyImage " << (d2h ? "D2H" : "H2D") << " stream=" << s.stream);
+    CopyImage(output_info, info, copy_direction, s.stream);
     CHECK_CUDA(cudaEventRecord(t.event, s.stream));  // record event for the next iteration to wait for
     if (d2h) {
         CHECK_CUDA(cudaStreamSynchronize(s.stream));

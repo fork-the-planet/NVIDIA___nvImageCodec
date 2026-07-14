@@ -100,6 +100,21 @@ def test_decode_tiff_uint16_reference(backends):
     reference = np.load(path_u16_npy)
     np.testing.assert_array_equal(decoded, reference)
 
+def test_decode_tiff_empty_clipped_oob_roi_fill():
+    fill_value = 77
+    path = os.path.join(img_dir_path, "tiff/cat-300572_640_no_compression.tiff")
+    decoder = nvimgcodec.Decoder(backends=[nvimgcodec.Backend(nvimgcodec.BackendKind.GPU_ONLY)])
+    code_stream = nvimgcodec.CodeStream(path)
+    region = nvimgcodec.Region(-16, 4, 0, 28, fill_value)
+
+    image = decoder.decode(code_stream.get_sub_code_stream(region=region))
+
+    assert image is not None
+    decoded = np.asarray(image.cpu())
+    assert decoded.shape[0] == 16
+    assert decoded.shape[1] == 24
+    assert (decoded == fill_value).all()
+
 # This tests used a crafted TIFF to provoke an OOM error,
 # to check that we don't crash and gracefully raise an error
 # See:

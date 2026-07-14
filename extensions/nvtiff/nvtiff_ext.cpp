@@ -35,9 +35,7 @@ struct NvTiffImgCodecsExtension
         , encoder_registered_(false)
     {
         // Load nvTIFF library and check version at plugin registration time
-        // nvTIFF version 0.4.0 is required
-        // nvTIFF version 0.6.0 is required for nvtiffDecodeImageEx API (out-of-bound ROI decoding support)
-        const NvtiffVersion MIN_NVTIFF_VERSION(0, 4, 0);
+        const NvtiffVersion MIN_NVTIFF_VERSION(0, 8, 0);
         
         NvtiffVersion version = get_nvtiff_version();
         if (!version) {
@@ -53,7 +51,7 @@ struct NvTiffImgCodecsExtension
         if (version < MIN_NVTIFF_VERSION) {
             NVIMGCODEC_LOG_WARNING(framework, "nvtiff_ext", 
                 "nvTIFF version " << version << " is older than minimum required version " << MIN_NVTIFF_VERSION 
-                << " (required for out-of-bound ROI decoding support). Decoders and encoders will not be registered.");
+                << ". Decoders and encoders will not be registered.");
             return;
         }
         
@@ -135,4 +133,3 @@ nvimgcodecStatus_t get_nvtiff_extension_desc(nvimgcodecExtensionDesc_t* ext_desc
     *ext_desc = nvtiff_extension;
     return NVIMGCODEC_STATUS_SUCCESS;
 }
-

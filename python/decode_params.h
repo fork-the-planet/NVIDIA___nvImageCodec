@@ -39,12 +39,15 @@ class DecodeParams
     void setColorSpec(nvimgcodecColorSpec_t color_spec){color_spec_ = color_spec;};
     bool getAllowAnyDepth() {return allow_any_depth_;}
     void setAllowAnyDepth(bool allow_any_depth){allow_any_depth_ = allow_any_depth;};
+    nvimgcodecSampleFormat_t getSampleFormat() {return sample_format_;}
+    void setSampleFormat(nvimgcodecSampleFormat_t sample_format){sample_format_ = sample_format;};
 
     static void exportToPython(py::module& m);
 
     nvimgcodecDecodeParams_t decode_params_;
     nvimgcodecColorSpec_t color_spec_;
     bool allow_any_depth_;
+    nvimgcodecSampleFormat_t sample_format_;
 };
 
 } // namespace nvimgcodec

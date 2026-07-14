@@ -28,6 +28,9 @@
 #include "error_handling.h"
 
 #include "imgproc/out_of_bound_roi_fill.h"
+#include "imgproc/region_orientation.h"
+#include "imgproc/image_info_checks.h"
+#include "imgproc/safe_arithmetic.h"
 
 namespace libjpeg_turbo {
 
@@ -141,6 +144,8 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(const nvimgcodecImageDesc_t*
             return NVIMGCODEC_STATUS_EXTENSION_INTERNAL_ERROR;
 
 
+        XM_CHECK_NULL(params);
+
         nvimgcodecProcessingStatus_t status = NVIMGCODEC_PROCESSING_STATUS_SUCCESS;
         if (codestream_info.code_stream_view) {
             if (codestream_info.code_stream_view->image_idx != 0) {
@@ -151,7 +156,9 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(const nvimgcodecImageDesc_t*
             if (region.ndim == 0) {
                 // no ROI, okay
             } else if (region.ndim == 2) {
-                if (nvimgcodec::is_region_out_of_bounds(region, cs_image_info.plane_info[0].width, cs_image_info.plane_info[0].height)) {
+                if (nvimgcodec::is_region_out_of_bounds_effective(region, image_info.orientation,
+                        cs_image_info.plane_info[0].width, cs_image_info.plane_info[0].height,
+                        params->apply_exif_orientation)) {
                     NVIMGCODEC_LOG_WARNING(framework_, plugin_id_, "Out of bounds region is not supported.");
                     status |= NVIMGCODEC_PROCESSING_STATUS_ROI_UNSUPPORTED;
                 }
@@ -160,8 +167,6 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(const nvimgcodecImageDesc_t*
                 NVIMGCODEC_LOG_WARNING(framework_, plugin_id_, "Region decoding is supported only for 2 dimensions.");
             }
         }
-        
-        XM_CHECK_NULL(params);
 
         switch (image_info.sample_format) {
         case NVIMGCODEC_SAMPLEFORMAT_I_BGR:
@@ -194,6 +199,9 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(const nvimgcodecImageDesc_t*
             status |= NVIMGCODEC_PROCESSING_STATUS_NUM_PLANES_UNSUPPORTED;
         }
         if (image_info.plane_info[0].sample_type != NVIMGCODEC_SAMPLE_DATA_TYPE_UINT8) {
+            status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
+        }
+        if (!nvimgcodec::check_planes_consistency(framework_, plugin_id_, image_info)) {
             status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
         }
         if (image_info.plane_info[0].num_channels != 3 && image_info.plane_info[0].num_channels != 1) {
@@ -397,15 +405,46 @@ nvimgcodecStatus_t DecoderImpl::decode(
             orig_sample_format == NVIMGCODEC_SAMPLEFORMAT_P_BGR ||
             orig_sample_format == NVIMGCODEC_SAMPLEFORMAT_P_YUV
         ) {
-            const int num_channels = 3;
-            uint32_t plane_size = image_info.plane_info[0].height * image_info.plane_info[0].width;
-            for (uint32_t i = 0; i < image_info.plane_info[0].height * image_info.plane_info[0].width; i++) {
-                *(dst + plane_size * 0 + i) = *(src + 0 + i * num_channels);
-                *(dst + plane_size * 1 + i) = *(src + 1 + i * num_channels);
-                *(dst + plane_size * 2 + i) = *(src + 2 + i * num_channels);
+            // De-interleave src(H,W,3) -> dst planar layout. The source is
+            // uniform across the three "channels" (libjpeg upsamples chroma
+            // internally), but each destination plane may carry its own
+            // row_stride / height (e.g. right-side row padding on a
+            // user-provided external buffer, or a subsampled layout). Walk
+            // plane_info[c] explicitly, with dst plane offsets the overflow-
+            // checked running sum of per-plane row_stride * height.
+            const size_t num_channels = 3;
+            const size_t src_width = image_info.plane_info[0].width;
+            const size_t src_height = image_info.plane_info[0].height;
+            const size_t src_row_size = src_width * num_channels;
+            size_t plane_offsets[NVIMGCODEC_MAX_NUM_PLANES];
+            if (!nvimgcodec::SafePlaneByteOffsets(image_info, plane_offsets)) {
+                NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Plane byte offsets overflow.");
+                image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_FAIL);
+                return NVIMGCODEC_STATUS_EXECUTION_FAILED;
+            }
+            for (size_t c = 0; c < num_channels; ++c) {
+                const auto& plane = image_info.plane_info[c];
+                const size_t row_stride = plane.row_stride;
+                const size_t copy_rows = std::min<size_t>(plane.height, src_height);
+                const size_t copy_cols = std::min<size_t>(plane.width, src_width);
+                uint8_t* plane_dst = dst + plane_offsets[c];
+                for (size_t y = 0; y < copy_rows; ++y) {
+                    uint8_t* row_dst = plane_dst + y * row_stride;
+                    const uint8_t* row_src = src + y * src_row_size;
+                    for (size_t x = 0; x < copy_cols; ++x) {
+                        row_dst[x] = row_src[x * num_channels + c];
+                    }
+                }
             }
         } else {
-            uint32_t row_size_bytes = image_info.plane_info[0].width * flags.components * sizeof(uint8_t);
+            size_t row_size_bytes = 0;
+            if (!nvimgcodec::SafeMul3SizeT(image_info.plane_info[0].width, flags.components, sizeof(uint8_t), row_size_bytes)) {
+                NVIMGCODEC_LOG_ERROR(framework_, plugin_id_,
+                    "Overflow computing row_size_bytes from width=" << image_info.plane_info[0].width
+                    << ", components=" << flags.components);
+                image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_FAIL);
+                return NVIMGCODEC_STATUS_EXECUTION_FAILED;
+            }
             for (uint32_t y = 0; y < image_info.plane_info[0].height; y++, dst += image_info.plane_info[0].row_stride, src += row_size_bytes) {
                 std::memcpy(dst, src, row_size_bytes);
             }

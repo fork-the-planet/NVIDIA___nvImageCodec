@@ -68,6 +68,25 @@ std::pair<std::unique_ptr<int64_t[]>, std::unique_ptr<int64_t[]>> copyShapeAndSt
     return {std::move(shape), std::move(strides)};
 }
 
+// DLPack counterpart of `is_padding_correct` (python/type_utils.h): only the row
+// dimension may carry padding; all inner dimensions must be packed. Both share the
+// `are_strides_row_padded_only` loop in type_utils.h.
+//
+// This is required because the cross-device path in Image::cuda() performs a flat
+// `cudaMemcpyPeerAsync` over `height * row_stride` bytes and would silently copy
+// non-image memory if any inner axis had a non-trivial stride.
+bool is_dlpack_padding_correct(const DLTensor& tensor, bool is_interleaved)
+{
+    if (tensor.strides == nullptr) {
+        return true;
+    }
+    // DLPack strides are in *elements* (not bytes), so the base element stride
+    // is 1. Defer to the shared check in type_utils.h.
+    std::vector<int64_t> shape(tensor.shape, tensor.shape + tensor.ndim);
+    std::vector<int64_t> strides(tensor.strides, tensor.strides + tensor.ndim);
+    return are_strides_row_padded_only(shape, strides, /*base_stride=*/1, is_interleaved);
+}
+
 } // anonymous namespace
 
 bool is_cuda_accessible(DLDeviceType devType)
@@ -221,23 +240,39 @@ DLPackTensor::DLPackTensor(ILogger* logger, DLManagedTensor* dl_managed_tensor)
 {
     // Copy tensor metadata into our internal structure
     internal_dl_managed_tensor_.dl_tensor = dl_managed_tensor->dl_tensor;
-    
-    // Copy shape and strides arrays (exception-safe via helper)
+
+    // Allocate the shape/strides buffers first; the unique_ptrs keep them
+    // owned for the rest of this function and will free them on stack
+    // unwinding if anything below throws.
     auto [shape, strides] = copyShapeAndStrides(dl_managed_tensor->dl_tensor);
-    internal_dl_managed_tensor_.dl_tensor.shape = shape.get();
-    internal_dl_managed_tensor_.dl_tensor.strides = strides.get();
-    
-    // Set up manager_ctx and deleter for our internal tensor
+
+    // Allocate manager_ctx before transferring ownership of shape/strides.
+    // 'new std::shared_ptr<...>' is the only call site below that can throw
+    // (std::bad_alloc); doing it first means a failure here leaves shape/
+    // strides still owned by their unique_ptrs.
     internal_dl_managed_tensor_.manager_ctx = new std::shared_ptr<DLPackTensorSharedState>(shared_state_);
     internal_dl_managed_tensor_.deleter = deleteDLManagedTensor;
 
-    // we can now release the unique_ptrs as they are owned by the internal_dl_managed_tensor_
-    shape.release();
-    strides.release();
+    // From this point on nothing throws. Hand the shape/strides buffers over
+    // to the DLManagedTensor; the deleter will free them via the manager_ctx
+    // we just installed.
+    internal_dl_managed_tensor_.dl_tensor.shape = shape.release();
+    internal_dl_managed_tensor_.dl_tensor.strides = strides.release();
 }
 
-// Export constructor - creates tensor from nvimgcodecImageInfo_t (export path)
-// Creates shared_state_ to enable multiple DLPack exports and keep data alive
+// Export constructor - creates tensor from nvimgcodecImageInfo_t (export path).
+// Creates shared_state_ to enable multiple DLPack exports and keep data alive.
+//
+// Coverity's PASS_BY_VALUE checker reports image_buffer is taken by value (sink pattern) 
+// so callers can either copy or std::move into this constructor, and the parameter is 
+// then std::move'd into shared_state_ in a single forwarding step.
+// This is intentional because the std::variant is sized for its largest alternative 
+// (nvimgcodecImageInfo_t, ~2168 bytes, above the 512-byte heuristic threshold), but 
+// the active alternative for the shared_ptr<...> arms is small and is moved cheaply. 
+// If a future maintainer wants to silence the checker structurally, change the parameter 
+// to `const ImageBuffer&` and drop the std::move below; the cost trade-off is negligible 
+// at current call sites.
+// coverity[pass_by_value : INTENTIONAL]
 DLPackTensor::DLPackTensor(ILogger* logger, const nvimgcodecImageInfo_t& image_info, 
                           ImageBuffer image_buffer)
     : internal_dl_managed_tensor_{}
@@ -282,7 +317,10 @@ DLPackTensor::DLPackTensor(ILogger* logger, const nvimgcodecImageInfo_t& image_i
     // Set up dtype
     tensor.dtype = type_to_dlpack(image_info.plane_info[0].sample_type);
 
-    bool is_interleaved = is_sample_format_interleaved(image_info.sample_format) || image_info.num_planes == 1;
+    // Use sample_format as the sole authority on layout, matching
+    // Image::shape / Image::strides / array_interface so all interop
+    // protocols report the same shape for a given Image.
+    bool is_interleaved = is_sample_format_interleaved(image_info.sample_format);
     int bytes_per_element = sample_type_to_bytes_per_element(image_info.plane_info[0].sample_type);
 
     // Set up shape (always required) - use unique_ptr for exception safety
@@ -363,7 +401,9 @@ DLTensor& DLPackTensor::operator*()
     return internal_dl_managed_tensor_.dl_tensor;
 }
 
-void DLPackTensor::getImageInfo(nvimgcodecImageInfo_t* image_info)
+void DLPackTensor::getImageInfo(nvimgcodecImageInfo_t* image_info,
+    std::optional<nvimgcodecSampleFormat_t> sample_format,
+    std::optional<nvimgcodecColorSpec_t> color_spec)
 {
     if (!isInitialized()) {
         throw std::runtime_error("Cannot get image info from null DLPackTensor");
@@ -375,8 +415,10 @@ void DLPackTensor::getImageInfo(nvimgcodecImageInfo_t* image_info)
     if (ndim > NVIMGCODEC_MAXDIMS) {
         throw std::runtime_error("DLPack tensor number of dimensions is higher than the supported maxdims=3");
     }
-    if (ndim < 3) {
-        throw std::runtime_error("DLPack tensor number of dimension is lower than expected at least 3");
+    if (ndim < 2) {
+        // 2-D (H, W) is accepted for single-channel/grayscale images, matching
+        // the array-interface as_image path.
+        throw std::runtime_error("DLPack tensor number of dimensions is lower than expected at least 2");
     }
 
     if (!is_cuda_accessible(tensor.device.device_type)) {
@@ -390,30 +432,39 @@ void DLPackTensor::getImageInfo(nvimgcodecImageInfo_t* image_info)
     auto sample_type = type_from_dlpack(tensor.dtype);
     int bytes_per_element = sample_type_to_bytes_per_element(sample_type);
 
-    bool is_interleaved = true; // For now always assume interleaved
-    void* buffer = (char*)tensor.data + tensor.byte_offset;
-    if (is_interleaved) {
-        image_info->num_planes = 1;
-        image_info->plane_info[0].height = tensor.shape[0];
-        image_info->plane_info[0].width = tensor.shape[1];
-        image_info->plane_info[0].num_channels = tensor.shape[2];
-    } else {
-        image_info->num_planes = tensor.shape[0];
-        image_info->plane_info[0].height = tensor.shape[1];
-        image_info->plane_info[0].width = tensor.shape[2];
-        image_info->plane_info[0].num_channels = 1;
+    // Layout (HWC vs CHW) and the sample_format / color_spec labels follow the
+    // caller's sample_format, resolved by the shared helpers in type_utils.h
+    // (the same logic the array-interface as_image path uses). 2-D (H, W) input
+    // is accepted for single-channel images.
+    std::vector<long> shape;
+    shape.reserve(ndim);
+    for (int i = 0; i < ndim; ++i)
+        shape.push_back(static_cast<long>(tensor.shape[i]));
+    const AsImageLayout layout = resolveAsImageLayout(shape, sample_format);
+    const bool is_interleaved = layout.is_interleaved;
+
+    if (!is_dlpack_padding_correct(tensor, is_interleaved)) {
+        throw std::runtime_error("Unexpected DLPack layout. Padding is only allowed for rows. Other dimensions must have contiguous strides.");
     }
+    void* buffer = (char*)tensor.data + tensor.byte_offset;
+    image_info->num_planes = layout.num_planes;
+    image_info->plane_info[0].height = layout.height;
+    image_info->plane_info[0].width = layout.width;
+    image_info->plane_info[0].num_channels = layout.num_channels;
 
-    image_info->color_spec = NVIMGCODEC_COLORSPEC_SRGB;
-    image_info->sample_format = is_interleaved ? NVIMGCODEC_SAMPLEFORMAT_I_RGB : NVIMGCODEC_SAMPLEFORMAT_P_RGB;
-    image_info->chroma_subsampling = NVIMGCODEC_SAMPLING_444;
+    const int num_channels =
+        is_interleaved ? static_cast<int>(layout.num_channels) : static_cast<int>(layout.num_planes);
+    const AsImageLabels labels = resolveAsImageLabels(num_channels, sample_format, color_spec);
+    image_info->sample_format = labels.sample_format;
+    image_info->color_spec = labels.color_spec;
+    image_info->chroma_subsampling = labels.chroma_subsampling;
 
+    // Row-stride axis: HWC and 2-D (H, W) -> axis 0; 3-D CHW planar -> axis 1
+    // (rows live inside each plane). DLPack strides are in elements, so convert
+    // to bytes; null strides mean the tensor is compact (row-major).
+    const int row_stride_axis = (ndim == 3 && !is_interleaved) ? 1 : 0;
     int pitch_in_bytes = (tensor.strides != NULL)
-                             ?
-                             //dlpack strides of the tensor are in number of elements, not bytes so need to multiple by bytes_per_element
-                             (is_interleaved ? tensor.strides[0] * bytes_per_element
-                                             : tensor.strides[1] * bytes_per_element)
-                             //can be NULL, indicating tensor is compact and row - majored
+                             ? tensor.strides[row_stride_axis] * bytes_per_element
                              : image_info->plane_info[0].width * image_info->plane_info[0].num_channels * bytes_per_element;
     for (size_t c = 0; c < image_info->num_planes; c++) {
         image_info->plane_info[c].width = image_info->plane_info[0].width;
@@ -444,9 +495,13 @@ py::capsule DLPackTensor::getPyCapsule(intptr_t consumer_stream, cudaStream_t pr
     // Wrap manager_ctx in unique_ptr for exception-safe cleanup
     auto manager_ctx_guard = std::make_unique<std::shared_ptr<DLPackTensorSharedState>>(shared_state_);
     
-    // Assign pointers to exported tensor (still owned by unique_ptrs)
+    // Assign pointers to exported tensor (still owned by unique_ptrs).
+    // Coverity reports WRAPPER_ESCAPE on the manager_ctx assignment because the raw pointer
+    // appears to outlive the unique_ptr; in fact ownership is transferred to the capsule
+    // deleter chain via the release() calls below before this function returns.
     exported_tensor->dl_tensor.shape = shape.get();
     exported_tensor->dl_tensor.strides = strides.get();
+    // coverity[escape : FALSE]
     exported_tensor->manager_ctx = manager_ctx_guard.get();
     
     // Set deleter for cleanup - calls helper then deletes the DLManagedTensor itself
@@ -481,10 +536,19 @@ py::capsule DLPackTensor::getPyCapsule(intptr_t consumer_stream, cudaStream_t pr
         PyErr_Restore(type, value, traceback);
     });
     
-    // Capsule successfully created - now release ownership from all smart pointers
+    // Capsule successfully created - now release ownership from all smart pointers.
+    // Coverity flags these release() calls as RESOURCE_LEAK because it cannot follow
+    // the ownership chain through exported_tensor->deleter -> deleteDLManagedTensor;
+    // each released pointer is in fact already aliased into exported_tensor's fields
+    // (or, for exported_tensor itself, owned by the py::capsule constructed above) and
+    // will be freed when the capsule's deleter runs.
+    // coverity[leaked_storage : FALSE]
     shape.release();
+    // coverity[leaked_storage : FALSE]
     strides.release();
+    // coverity[leaked_storage : FALSE]
     manager_ctx_guard.release();
+    // coverity[leaked_storage : FALSE]
     exported_tensor.release();
 
     // Add synchronisation

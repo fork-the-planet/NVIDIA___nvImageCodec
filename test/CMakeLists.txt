@@ -34,14 +34,20 @@ set(SRCS
     api/can_encode_test.cpp
     api/api_mismatch_test.cpp
     api/api_negative_test.cpp
+    api/bitstream_offset_test.cpp
     api/object_reuse_test.cpp
     api/concurrent_decode_test.cpp
+    api/concurrent_encode_test.cpp
+    api/decode_batch_only_fallback_test.cpp
     imgproc/convert_cuda_test.cu
     imgproc/convert_test.cc
     imgproc/geom_mat_test.cu
     imgproc/geom_vec_test.cu
     imgproc/math_util_test.cc
+    imgproc/safe_arithmetic_test.cc
     imgproc/devstring_cuda_test.cu
+    imgproc/region_orientation_test.cc
+    extensions/roi_orientation_integration_test.cpp
 )
 
 set(HEADERS
@@ -101,7 +107,6 @@ if (BUILD_NVJPEG_EXT)
     if(NVJPEG_LOSSLESS_SUPPORTED)
         list(APPEND SRCS extensions/nvjpeg_ext_lossless_decoder_test.cpp)
     endif()
-    add_compile_definitions(BUILD_NVJPEG_EXT)
 endif()
 
 
@@ -113,7 +118,6 @@ endif()
 
 if (BUILD_LIBJPEG_TURBO_EXT)
     list(APPEND SRCS extensions/libjpeg_turbo_ext_decoder_test.cpp)
-    add_compile_definitions(BUILD_LIBJPEG_TURBO_EXT)
 endif()
 
 if (BUILD_LIBTIFF_EXT)
@@ -139,6 +143,18 @@ if (BUILD_NVTIFF_EXT)
     list(APPEND SRCS extensions/nvtiff_ext_encoder_test.cpp)
 endif()
 
+# Propagate every enabled BUILD_*_EXT option as a same-named preprocessor
+# define so test sources can guard `#include <extensions/.../...ext.h>` and
+# skip themselves when the matching extension isn't built.
+propagate_option_as_definition(BUILD_NVJPEG_EXT)
+propagate_option_as_definition(BUILD_NVJPEG2K_EXT)
+propagate_option_as_definition(BUILD_NVTIFF_EXT)
+propagate_option_as_definition(BUILD_NVBMP_EXT)
+propagate_option_as_definition(BUILD_NVPNM_EXT)
+propagate_option_as_definition(BUILD_LIBJPEG_TURBO_EXT)
+propagate_option_as_definition(BUILD_LIBTIFF_EXT)
+propagate_option_as_definition(BUILD_OPENCV_EXT)
+
 set(FILESTOPACK nvimgcodec_tests)
 
 if (SKIP_NVTIFF_WITH_NVCOMP_TESTS)
@@ -154,6 +170,10 @@ foreach(testapp nvimgcodec_tests)
     target_include_directories(${testapp} SYSTEM BEFORE
         PRIVATE
         ${GTEST_INCLUDE_DIRS}
+    )
+    target_include_directories(${testapp}
+        PRIVATE
+        ${PROJECT_SOURCE_DIR}/extensions
     )
 
     target_link_libraries(${testapp} PRIVATE "-pie")
@@ -172,7 +192,7 @@ foreach(testapp nvimgcodec_tests)
     if (WITH_DYNAMIC_NVJPEG)
         list(APPEND TARGET_LIBS dynlink_nvjpeg)
     else()
-        list(APPEND TARGET_LIBS CUDA::nvjpeg_static)
+        list(APPEND TARGET_LIBS ${CUDA_NVJPEG_LIB})
     endif()
 
     if (BUILD_NVJPEG2K_EXT)
@@ -225,7 +245,7 @@ foreach(testapp nvimgcodec_tests)
     target_link_libraries(${testapp} PUBLIC
         ${TARGET_LIBS}
         ${OpenCV_LIBRARIES}
-        CUDA::cudart_static
+        ${CUDA_CUDART_LIB}
         CUDA::cuda_driver
         gtest
         gmock
@@ -259,7 +279,7 @@ install(FILES
 
 install(FILES
     ${CMAKE_SOURCE_DIR}/pytest.ini
-    DESTINATION .
+    DESTINATION test
     COMPONENT tests
 )
 

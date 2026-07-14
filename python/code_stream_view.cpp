@@ -18,7 +18,6 @@
 #include "code_stream_view.h"
 #include <iostream>
 #include <sstream>
-#include "error_handling.h"
 
 #include <pybind11/stl.h>
 
@@ -32,14 +31,14 @@ void CodeStreamView::exportToPython(py::module& m)
             Class representing a view into a code stream, specifying which image and region to access.
 
             A code stream view consists of an image index, optional region of interest, and optional
-            TIFF-specific parameters for SubIFD access and pagination.
+            TIFF-specific parameters for SubIFD and IFD-offset access.
             )pbdoc")
         .def(py::init([](size_t image_idx, const std::optional<Region>& region,
-                         size_t bitstream_offset, uint32_t limit_images) {
-            return CodeStreamView(image_idx, region, bitstream_offset, limit_images);
+                         std::optional<size_t> bitstream_offset) {
+            return CodeStreamView(image_idx, region, bitstream_offset);
         }), 
             "image_idx"_a = 0, "region"_a = std::nullopt,
-            "bitstream_offset"_a = 0, "limit_images"_a = 0,
+            "bitstream_offset"_a = py::none(),
             R"pbdoc(
             Constructor that initializes a CodeStreamView with an image index, region, and TIFF-specific parameters.
 
@@ -48,11 +47,12 @@ void CodeStreamView::exportToPython(py::module& m)
                 
                 region: Optional region of interest within the image.
                 
-                bitstream_offset: Byte offset to start parsing from (for TIFF SubIFD access). 
-                    Defaults to 0 (parse from file header).
-                
-                limit_images: Maximum number of images to parse (for TIFF pagination).
-                    Defaults to 0 (no limit, parse all).
+                bitstream_offset: For TIFF files, nonzero byte offset of one IFD to select.
+                    Defaults to None (parse from file header); 0 is equivalent to None.
+                    A nonzero bitstream_offset combined with a nonzero image_idx is rejected
+                    when the view is applied to a CodeStream. A nonzero bitstream_offset
+                    creates a one-image view and num_images reports 1; query the root
+                    CodeStream for the total root page count.
             )pbdoc")
         .def_property_readonly("image_idx", &CodeStreamView::imageIdx, 
             R"pbdoc(
@@ -70,17 +70,10 @@ void CodeStreamView::exportToPython(py::module& m)
             )pbdoc")
         .def_property_readonly("bitstream_offset", &CodeStreamView::bitstreamOffset,
             R"pbdoc(
-            Property to get the bitstream offset for TIFF SubIFD access.
+            Property to get the TIFF IFD bitstream offset.
 
             Returns:
-                The byte offset where parsing starts (0 = from file header).
-            )pbdoc")
-        .def_property_readonly("limit_images", &CodeStreamView::limitImages,
-            R"pbdoc(
-            Property to get the limit on number of images to parse.
-
-            Returns:
-                Maximum number of images to parse (0 = no limit).
+                The selected IFD byte offset, or 0 for the default view.
             )pbdoc")
         .def("__repr__", [](const CodeStreamView* v) {
             std::stringstream ss;
@@ -108,11 +101,8 @@ std::ostream& operator<<(std::ostream& os, const CodeStreamView& v)
     if (v.impl_.bitstream_offset != 0) {
         os << ", bitstream_offset=" << v.impl_.bitstream_offset;
     }
-    if (v.impl_.limit_images != 0) {
-        os << ", limit_images=" << v.impl_.limit_images;
-    }
     os << ")";
     return os;
 }
 
-} // namespace nvimgcodec 
+} // namespace nvimgcodec

@@ -352,4 +352,11 @@ INSTANTIATE_TEST_SUITE_P(NVTIFF_ENCODE_RANDOM_UNSUPPORTED_QUALITY_TYPE,
     )
 );
 
+// NOTE: nvTIFF is intentionally NOT covered by the strided encode->decode
+// round-trip tests. Its encoder requires packed, interleaved input: planar
+// (P_RGB) input is rejected outright, and a padded row_stride is rejected with
+// "[nvtiff_cuda_encoder] Row stride not the same as width * sample_size *
+// num_channels". A strided round-trip therefore cannot succeed without changing
+// the codec, so adding such tests here would only assert that limitation.
+
 }} // namespace nvimgcodec::test

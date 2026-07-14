@@ -27,56 +27,62 @@
 namespace nvimgcodec {
 
 CodeStream::CodeStream(nvimgcodecInstance_t instance, ILogger* logger, const std::filesystem::path& filename,
-                       size_t bitstream_offset, uint32_t limit_images)
+                       std::optional<size_t> bitstream_offset)
     : instance_{instance}
     , logger_{logger}
     , code_stream_{nullptr}
 {
     py::gil_scoped_release release;
+    const size_t offset = bitstream_offset.value_or(0);
     nvimgcodecCodeStreamView_t view{NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_VIEW, sizeof(nvimgcodecCodeStreamView_t),
-        nullptr, 0, {}, bitstream_offset, limit_images};
+        nullptr, 0, {}, offset};
     auto ret = nvimgcodecCodeStreamCreateFromFile(instance, &code_stream_, filename.string().c_str(),
-        (bitstream_offset != 0 || limit_images != 0) ? &view : nullptr);
+        offset != 0 ? &view : nullptr);
     if (ret != NVIMGCODEC_STATUS_SUCCESS)
         throw std::runtime_error("Failed to create code stream");
+    if (offset != 0) {
+        view_ = CodeStreamView(0, std::nullopt, offset);
+    }
 }
 
 CodeStream::CodeStream(nvimgcodecInstance_t instance, ILogger* logger, const unsigned char * data, size_t len,
-                       size_t bitstream_offset, uint32_t limit_images)
+                       std::optional<size_t> bitstream_offset)
     : instance_{instance}
     , logger_{logger}
     , code_stream_{nullptr}
 {
     py::gil_scoped_release release;
+    const size_t offset = bitstream_offset.value_or(0);
     nvimgcodecCodeStreamView_t view{NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_VIEW, sizeof(nvimgcodecCodeStreamView_t),
-        nullptr, 0, {}, bitstream_offset, limit_images};
+        nullptr, 0, {}, offset};
     auto ret = nvimgcodecCodeStreamCreateFromHostMem(instance, &code_stream_, data, len,
-        (bitstream_offset != 0 || limit_images != 0) ? &view : nullptr);
+        offset != 0 ? &view : nullptr);
     if (ret != NVIMGCODEC_STATUS_SUCCESS)
         throw std::runtime_error("Failed to create code stream");
+    if (offset != 0) {
+        view_ = CodeStreamView(0, std::nullopt, offset);
+    }
 }
 
 CodeStream::CodeStream(nvimgcodecInstance_t instance, ILogger* logger, py::bytes data,
-                       size_t bitstream_offset, uint32_t limit_images)
+                       std::optional<size_t> bitstream_offset)
     : CodeStream(
         instance,
         logger,
         reinterpret_cast<const unsigned char*>(
             static_cast<std::string_view>(data).data()),
         static_cast<std::string_view>(data).size(),
-        bitstream_offset,
-        limit_images)
+        bitstream_offset)
 {
     data_ref_bytes_ = data;
 }
 
 CodeStream::CodeStream(nvimgcodecInstance_t instance, ILogger* logger, py::array_t<uint8_t> arr,
-                       size_t bitstream_offset, uint32_t limit_images)
+                       std::optional<size_t> bitstream_offset)
     : CodeStream(instance, logger,
         arr.unchecked<1>().data(0),
         arr.size(),
-        bitstream_offset,
-        limit_images)
+        bitstream_offset)
 {
     data_ref_arr_ = arr;
 }
@@ -123,8 +129,6 @@ CodeStream::CodeStream(nvimgcodecInstance_t instance, ILogger* logger, size_t pr
 CodeStream::CodeStream(nvimgcodecInstance_t instance, ILogger* logger, nvimgcodecImageInfo_t& out_image_info, bool pin_memory)
     : instance_{instance}
     , logger_{logger}
-    , image_info_{out_image_info}
-    , image_info_read_{true}
     , code_stream_{nullptr}
     , pin_memory_{pin_memory}
 {
@@ -137,6 +141,8 @@ CodeStream::CodeStream(nvimgcodecInstance_t instance, ILogger* logger, nvimgcode
     auto ret = nvimgcodecCodeStreamCreateToHostMem(instance, &code_stream_, (void*)this, &static_resize_buffer, &out_image_info);
     if (ret != NVIMGCODEC_STATUS_SUCCESS)
         throw std::runtime_error("Failed to create code stream");
+    // out_image_info is the requested output layout. Query after encode so the
+    // returned CodeStream exposes metadata from the produced codestream.
 }
 
 CodeStream::CodeStream(nvimgcodecInstance_t instance, ILogger* logger, const std::filesystem::path& filename, nvimgcodecImageInfo_t& out_image_info)
@@ -150,10 +156,12 @@ CodeStream::CodeStream(nvimgcodecInstance_t instance, ILogger* logger, const std
         throw std::runtime_error("Failed to create code stream");
 }
 
-CodeStream::CodeStream(nvimgcodecInstance_t instance, ILogger* logger, nvimgcodecCodeStream_t code_stream)
+CodeStream::CodeStream(nvimgcodecInstance_t instance, ILogger* logger, nvimgcodecCodeStream_t code_stream,
+                       std::optional<CodeStreamView> view)
     : instance_{instance}
     , logger_{logger}
     , code_stream_{code_stream}
+    , view_{std::move(view)}
 {
 }
 
@@ -166,12 +174,22 @@ CodeStream::~CodeStream()
 
 void CodeStream::reuse(nvimgcodecImageInfo_t& out_image_info)
 {
+    view_ = std::nullopt;
     py::gil_scoped_release release;
+    // From-file / from-bytes constructors leave the output buffer uninitialized;
+    // prime whichever variant matches pin_memory_ so static_resize_buffer can grow it.
+    if (pin_memory_) {
+        if (!pinned_buffer_) pinned_buffer_ = PinnedBuffer();
+    } else {
+        if (!host_buffer_) host_buffer_ = std::vector<unsigned char>();
+    }
     auto ret = nvimgcodecCodeStreamCreateToHostMem(instance_, &code_stream_, (void*)this, &static_resize_buffer, &out_image_info);
     if (ret != NVIMGCODEC_STATUS_SUCCESS)
         throw std::runtime_error("Failed to create code stream");
-    image_info_ = out_image_info;
-    image_info_read_ = true;
+    // out_image_info is the requested output layout. Reused CodeStreams must
+    // refresh metadata from the produced codestream after encoding.
+    image_info_read_ = false;
+    codestream_info_read_ = false;
 }
 
 nvimgcodecCodeStream_t CodeStream::handle() const {
@@ -271,11 +289,7 @@ std::optional<int> CodeStream::tile_offset_y() const {
 
 std::optional<CodeStreamView> CodeStream::view() const
 {
-    auto& info = getCodeStreamInfo();
-    if (!info.code_stream_view) {
-        return std::nullopt;
-    }
-    return CodeStreamView(*info.code_stream_view);
+    return view_;
 }
 
 int CodeStream::num_channels() const 
@@ -296,10 +310,10 @@ py::dtype CodeStream::dtype() const
     return py::dtype(format);
 }
 
-int CodeStream::precision() const 
+int CodeStream::precision() const
 {
     auto& info = getImageInfo();
-    return info.plane_info[0].precision;
+    return resolve_precision(info.plane_info[0].precision, info.plane_info[0].sample_type);
 }
 
 std::string CodeStream::codec_name() const 
@@ -355,12 +369,28 @@ nvimgcodecSampleFormat_t CodeStream::getSampleFormat() const
     return info.sample_format;
 }
 
-std::optional<size_t> CodeStream::next_bitstream_offset() const
+nvimgcodecChromaSubsampling_t CodeStream::getChromaSubsampling() const
+{
+    auto& info = getImageInfo();
+    return info.chroma_subsampling;
+}
+
+std::optional<size_t> CodeStream::ifd_offset() const
 {
     auto& info = getCodeStreamInfo();
     const auto* tiff_ext = findInfoTiffExt(&info);
-    if (tiff_ext && tiff_ext->next_bitstream_offset != 0) {
-        return tiff_ext->next_bitstream_offset;
+    if (tiff_ext && tiff_ext->ifd_offset != 0) {
+        return tiff_ext->ifd_offset;
+    }
+    return std::nullopt;
+}
+
+std::optional<size_t> CodeStream::next_ifd_offset() const
+{
+    auto& info = getCodeStreamInfo();
+    const auto* tiff_ext = findInfoTiffExt(&info);
+    if (tiff_ext && tiff_ext->next_ifd_offset != 0) {
+        return tiff_ext->next_ifd_offset;
     }
     return std::nullopt;
 }
@@ -379,21 +409,29 @@ std::vector<size_t> CodeStream::subifd_offsets() const
 CodeStream* CodeStream::getSubCodeStream(const CodeStreamView& code_stream_view)
 {
     nvimgcodecCodeStream_t sub_code_stream{nullptr};
+    auto effective_view = code_stream_view;
     {
-        size_t nimg = num_images();
-
-        if (code_stream_view.impl_.image_idx >= nimg) {
-            throw std::runtime_error("Image index #" + std::to_string(code_stream_view.impl_.image_idx) + " out of range (0, " + std::to_string(nimg - 1) + ")");
-        }
-        auto already_have_region = view() && view()->impl_.region.ndim != 0;
-        if (already_have_region && code_stream_view.impl_.region.ndim != 0) {
-            throw std::runtime_error("Cannot create a sub code stream with nested regions. This is not supported.");
+        if (view_) {
+            const auto& parent_view = view_->impl_;
+            if (parent_view.region.ndim != 0) {
+                throw std::runtime_error("Cannot create a sub code stream with nested regions. This is not supported.");
+            }
+            if (code_stream_view.impl_.image_idx != 0) {
+                throw std::runtime_error("Cannot apply nonzero image_idx to a sub code stream.");
+            }
+            if (effective_view.impl_.bitstream_offset == 0) {
+                if (parent_view.bitstream_offset != 0) {
+                    effective_view.impl_.bitstream_offset = parent_view.bitstream_offset;
+                } else if (effective_view.impl_.image_idx == 0) {
+                    effective_view.impl_.image_idx = parent_view.image_idx;
+                }
+            }
         }
         py::gil_scoped_release release;
         CHECK_NVIMGCODEC(nvimgcodecCodeStreamGetSubCodeStream(code_stream_, &sub_code_stream, &code_stream_view.impl_));
     }
 
-    return new CodeStream(instance_, logger_, sub_code_stream);
+    return new CodeStream(instance_, logger_, sub_code_stream, effective_view);
 }
 
 void CodeStream::exportToPython(py::module& m, nvimgcodecInstance_t instance, ILogger* logger)
@@ -407,10 +445,10 @@ void CodeStream::exportToPython(py::module& m, nvimgcodecInstance_t instance, IL
         and tiling details. It supports initialization from bytes, numpy arrays, or file path.
         )pbdoc",
         py::buffer_protocol())
-        .def(py::init([instance, logger](py::bytes bytes, size_t bitstream_offset, uint32_t limit_images) {
-                return new CodeStream(instance, logger, bytes, bitstream_offset, limit_images);
+        .def(py::init([instance, logger](py::bytes bytes, std::optional<size_t> bitstream_offset) {
+                return new CodeStream(instance, logger, bytes, bitstream_offset);
             }),
-            "bytes"_a, "bitstream_offset"_a = 0, "limit_images"_a = 0, py::keep_alive<1, 2>(),
+            "bytes"_a, "bitstream_offset"_a = py::none(), py::keep_alive<1, 2>(),
             R"pbdoc(
             Initialize a CodeStream using bytes as input.
 
@@ -420,16 +458,16 @@ void CodeStream::exportToPython(py::module& m, nvimgcodecInstance_t instance, IL
             Args:
                 bytes: The byte data representing the encoded stream.
 
-                bitstream_offset: For TIFF files, byte offset to start parsing IFDs from.
-                    Defaults to 0 (parse from file header).
+                bitstream_offset: For TIFF files, nonzero byte offset of one IFD to select.
+                    Defaults to None (parse from file header); 0 is equivalent to None.
+                    A nonzero bitstream_offset creates a one-image view and num_images
+                    reports 1. Query the root CodeStream for the total root page count.
 
-                limit_images: For TIFF files, maximum number of images to parse.
-                    Defaults to 0 (no limit, parse all).
             )pbdoc")
-        .def(py::init([instance, logger](py::array_t<uint8_t> arr, size_t bitstream_offset, uint32_t limit_images) {
-                return new CodeStream(instance, logger, arr, bitstream_offset, limit_images);
+        .def(py::init([instance, logger](py::array_t<uint8_t> arr, std::optional<size_t> bitstream_offset) {
+                return new CodeStream(instance, logger, arr, bitstream_offset);
             }),
-            "array"_a, "bitstream_offset"_a = 0, "limit_images"_a = 0, py::keep_alive<1, 2>(),
+            "array"_a, "bitstream_offset"_a = py::none(), py::keep_alive<1, 2>(),
             R"pbdoc(
             Initialize a CodeStream using a numpy array of uint8 as input.
 
@@ -439,17 +477,17 @@ void CodeStream::exportToPython(py::module& m, nvimgcodecInstance_t instance, IL
             Args:
                 array: The numpy array containing the encoded stream.
 
-                bitstream_offset: For TIFF files, byte offset to start parsing IFDs from.
-                    Defaults to 0 (parse from file header).
+                bitstream_offset: For TIFF files, nonzero byte offset of one IFD to select.
+                    Defaults to None (parse from file header); 0 is equivalent to None.
+                    A nonzero bitstream_offset creates a one-image view and num_images
+                    reports 1. Query the root CodeStream for the total root page count.
 
-                limit_images: For TIFF files, maximum number of images to parse.
-                    Defaults to 0 (no limit, parse all).
             )pbdoc")
         .def(py::init([instance, logger](const std::filesystem::path& filename,
-                                          size_t bitstream_offset, uint32_t limit_images) {
-                return new CodeStream(instance, logger, filename, bitstream_offset, limit_images);
+                                          std::optional<size_t> bitstream_offset) {
+                return new CodeStream(instance, logger, filename, bitstream_offset);
             }),
-            "filename"_a, "bitstream_offset"_a = 0, "limit_images"_a = 0,
+            "filename"_a, "bitstream_offset"_a = py::none(),
             R"pbdoc(
             Initialize a CodeStream using a file path as input.
 
@@ -459,13 +497,12 @@ void CodeStream::exportToPython(py::module& m, nvimgcodecInstance_t instance, IL
             Args:
                 filename: The file path to the encoded stream data.
 
-                bitstream_offset: For TIFF files, byte offset to start parsing IFDs from.
-                    Use this to continue pagination from next_bitstream_offset or to access
-                    SubIFDs directly. Defaults to 0 (parse from file header).
+                bitstream_offset: For TIFF files, nonzero byte offset of one IFD to select.
+                    Use offsets from next_ifd_offset or subifd_offsets. Defaults to None
+                    (parse from file header); 0 is equivalent to None.
+                    A nonzero bitstream_offset creates a one-image view and num_images
+                    reports 1. Query the root CodeStream for the total root page count.
 
-                limit_images: For TIFF files, maximum number of images to parse.
-                    When set, parsing stops after this many IFDs and next_bitstream_offset
-                    will contain the offset to continue. Defaults to 0 (no limit, parse all).
             )pbdoc")
         .def(py::init([instance, logger](size_t pre_allocated_size, bool pin_memory) {
                 return new CodeStream(instance, logger, pre_allocated_size, pin_memory);
@@ -509,11 +546,11 @@ void CodeStream::exportToPython(py::module& m, nvimgcodecInstance_t instance, IL
                }
             })
         .def("get_sub_code_stream", [](CodeStream& self, size_t image_idx, std::optional<Region> region,
-                                         size_t bitstream_offset, uint32_t limit_images) -> CodeStream* {
-                return self.getSubCodeStream(CodeStreamView(image_idx, region, bitstream_offset, limit_images));
+                                         std::optional<size_t> bitstream_offset) -> CodeStream* {
+                return self.getSubCodeStream(CodeStreamView(image_idx, region, bitstream_offset));
             },
             "image_idx"_a = 0, "region"_a = std::nullopt,
-            "bitstream_offset"_a = 0, "limit_images"_a = 0,
+            "bitstream_offset"_a = py::none(),
             /* Keep this (1) CodeStream alive as long as newly created and returned (0) codeStream is alive.
              * This is required as this CodeStream may keep alive python object with data (like bytes).
             */
@@ -526,14 +563,13 @@ void CodeStream::exportToPython(py::module& m, nvimgcodecInstance_t instance, IL
                 
                 region: Optional region of interest within the image.
                 
-                bitstream_offset: Byte offset to start parsing from (for TIFF SubIFD access).
-                    Use this to access SubIFDs by providing the offset from TIFF Tag 330 metadata.
-                    Defaults to 0 (parse from file header).
+                bitstream_offset: For TIFF files, nonzero byte offset of one IFD to select.
+                    Use offsets from next_ifd_offset or subifd_offsets. Defaults to None;
+                    0 is equivalent to None. A nonzero bitstream_offset cannot be
+                    combined with a nonzero image_idx. A nonzero bitstream_offset creates
+                    a one-image view and num_images reports 1. Query the root CodeStream
+                    for the total root page count.
                 
-                limit_images: Maximum number of images to parse (for TIFF pagination).
-                    When set, parsing stops after this many IFDs and next_bitstream_offset
-                    will contain the offset to continue. Defaults to 0 (no limit, parse all).
-
             Returns:
                 A new CodeStream object representing the sub code stream.
             )pbdoc")
@@ -549,7 +585,8 @@ void CodeStream::exportToPython(py::module& m, nvimgcodecInstance_t instance, IL
             Get a sub code stream using a CodeStreamView object.
 
             Args:
-                view: A CodeStreamView object specifying the image index and optional region.
+                view: A CodeStreamView object specifying the image index, optional region,
+                    or TIFF bitstream offset.
 
             Returns:
                 A new CodeStream object representing the sub code stream.
@@ -557,16 +594,29 @@ void CodeStream::exportToPython(py::module& m, nvimgcodecInstance_t instance, IL
         .def_property_readonly("num_images", &CodeStream::num_images, 
             R"pbdoc(
             The number of images in the code stream.
+
+            For TIFF root streams, this counts the full root IFD chain on first
+            access and caches the result. TIFF substreams created with image_idx
+            or bitstream_offset are one-image views and report 1. Query the root
+            CodeStream when the total root page count is needed.
             )pbdoc")
-        .def_property_readonly("next_bitstream_offset", &CodeStream::next_bitstream_offset,
+        .def_property_readonly("ifd_offset", &CodeStream::ifd_offset,
             R"pbdoc(
-            For TIFF files with pagination enabled: the byte offset to the next IFD.
+            For TIFF files: the byte offset of the selected image's IFD.
 
-            When limit_images is specified in get_sub_code_stream(), this property returns
-            the offset to continue parsing at. Returns None if there are no more images
-            or if the file format doesn't support pagination.
+            Returns None for non-TIFF files or when the offset is not available.
 
-            Use this for efficient traversal of large multi-page TIFF files.
+            Note: on a root CodeStream this triggers a one-time parse of the full root chain;
+            use ``get_sub_code_stream(0).ifd_offset`` for lazy single-image access.
+            )pbdoc")
+        .def_property_readonly("next_ifd_offset", &CodeStream::next_ifd_offset,
+            R"pbdoc(
+            For TIFF files: the byte offset of the next sibling IFD.
+
+            Returns None if there is no next sibling IFD or the file format is not TIFF.
+
+            Note: on a root CodeStream this triggers a one-time parse of the full root chain;
+            use ``get_sub_code_stream(0).next_ifd_offset`` for lazy single-image access.
             )pbdoc")
         .def_property_readonly("subifd_offsets", &CodeStream::subifd_offsets,
             R"pbdoc(
@@ -578,11 +628,15 @@ void CodeStream::exportToPython(py::module& m, nvimgcodecInstance_t instance, IL
 
             Returns an empty list if no SubIFDs exist or if the format is not TIFF.
 
-            Example:
+            Note: on a root CodeStream this triggers a one-time parse of the full root chain;
+            use ``get_sub_code_stream(0)`` for lazy single-image access.
+
+            Example::
+
                 cs = nvimgcodec.CodeStream(path)
                 sub = cs.get_sub_code_stream(image_idx=0)
                 for offset in sub.subifd_offsets:
-                    subifd_cs = nvimgcodec.CodeStream(path, bitstream_offset=offset)
+                    subifd_cs = cs.get_sub_code_stream(bitstream_offset=offset)
             )pbdoc")
         .def_property_readonly("height", &CodeStream::height, 
             R"pbdoc(
@@ -602,10 +656,14 @@ void CodeStream::exportToPython(py::module& m, nvimgcodecInstance_t instance, IL
             R"pbdoc(
             Data type of samples.
             )pbdoc")
-        .def_property_readonly("precision", &CodeStream::precision, 
+        .def_property_readonly("precision", &CodeStream::precision,
             R"pbdoc(
-            Maximum number of significant bits in data type. Value 0 
-            means that precision is equal to data type bit depth.
+            Number of significant bits per sample as declared by the encoded bitstream.
+
+            For formats that record a precision below the storage type's bitdepth (e.g. a
+            12-bit JPEG 2000 image stored as uint16), this returns the bitstream's declared
+            precision. When the bitstream does not encode a separate precision, this returns
+            the full bitdepth of the sample data type (8 for ``uint8``, 16 for ``uint16``, etc.).
             )pbdoc")
         .def_property_readonly("codec_name", &CodeStream::codec_name, 
             R"pbdoc(
@@ -636,6 +694,10 @@ void CodeStream::exportToPython(py::module& m, nvimgcodecInstance_t instance, IL
         .def_property_readonly("sample_format", &CodeStream::getSampleFormat, 
             R"pbdoc(
             The sample format of the code stream indicating how color components are matched to channels and channels to planes.
+            )pbdoc")
+        .def_property_readonly("chroma_subsampling", &CodeStream::getChromaSubsampling,
+            R"pbdoc(
+            The chroma subsampling of the encoded image.
             )pbdoc")
         .def_property_readonly("view", &CodeStream::view,
             R"pbdoc(

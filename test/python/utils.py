@@ -19,65 +19,65 @@ from nvidia import nvimgcodec
 import os
 import numpy as np
 import platform
-import ctypes
+
+NVJPEG_WITH_FIXED_UPSAMPLING_VERSION = (13, 2, 0)
+
+
+def _loaded_nvjpeg_libraries(cuda_major_version, system):
+    """Yield nvJPEG libraries that nvImageCodec has already loaded.
+
+    Importing nvimgcodec creates its native instance and loads the nvJPEG
+    extension before this helper runs. Reusing that module guarantees that the
+    version queried here belongs to the same nvJPEG selected by nvImageCodec.
+    """
+    if system == "Windows":
+        library_names = [f"nvjpeg64_{cuda_major_version}.dll", "nvjpeg.dll"]
+
+        # GetModuleHandleW only looks in the current process. It returns a
+        # borrowed handle, so this check neither loads nor owns another DLL.
+        get_module_handle = c.windll.kernel32.GetModuleHandleW
+        get_module_handle.argtypes = [c.c_wchar_p]
+        get_module_handle.restype = c.c_void_p
+        for library_name in library_names:
+            handle = get_module_handle(library_name)
+            if handle:
+                yield c.CDLL(library_name, handle=handle)
+        return
+
+    if system == "Linux":
+        library_names = [f"libnvjpeg.so.{cuda_major_version}", "libnvjpeg.so"]
+        no_load = getattr(os, "RTLD_NOLOAD", None)
+        if no_load is None:
+            return
+
+        # RTLD_NOLOAD makes dlopen fail instead of loading a missing library.
+        # RTLD_LAZY is required by dlopen but does not change that guarantee.
+        mode = os.RTLD_LAZY | no_load
+        for library_name in library_names:
+            try:
+                yield c.CDLL(library_name, mode=mode)
+            except OSError:
+                continue
 
 
 def get_nvjpeg_ver():
-    nvjpeg_ver_major, nvjpeg_ver_minor, nvjpeg_ver_patch = (c.c_int(), c.c_int(), c.c_int())
-    nvjpeg_found = False
     cuda_major_version = str(nvimgcodec.__cuda_version__ // 1000)
-
-    # Try standard paths by CDLL first (this should include PATH, LD_LIBRARY_PATH, etc)
-    libnames = [
-        'libnvjpeg.so',
-        f'libnvjpeg.so.{cuda_major_version}',
-        f'nvjpeg64_{cuda_major_version}.dll'
-    ]
-    for libname in libnames:
+    for nvjpeg_lib in _loaded_nvjpeg_libraries(cuda_major_version, platform.system()):
         try:
-            nvjpeg_lib = c.CDLL(libname)
-            nvjpeg_lib.nvjpegGetProperty(0, c.byref(nvjpeg_ver_major))
-            nvjpeg_lib.nvjpegGetProperty(1, c.byref(nvjpeg_ver_minor))
-            nvjpeg_lib.nvjpegGetProperty(2, c.byref(nvjpeg_ver_patch))
-            nvjpeg_found = True
-            break
-        except:
+            get_property = nvjpeg_lib.nvjpegGetProperty
+            get_property.argtypes = [c.c_int, c.POINTER(c.c_int)]
+            get_property.restype = c.c_int
+            version = [c.c_int(), c.c_int(), c.c_int()]
+            statuses = [
+                get_property(index, c.byref(value)) for index, value in enumerate(version)
+            ]
+            # A library is usable only when all three version queries succeed.
+            if all(status == 0 for status in statuses):
+                return tuple(value.value for value in version)
+        except (AttributeError, OSError):
             continue
-    
-    if not nvjpeg_found:
-        # If standard approach fails, search in python site-packages then CTK default path
-        nvimgcodec_dir = os.path.dirname(nvimgcodec.__file__)
-        search_paths = []
-        if platform.system() == "Windows":
-            search_paths.append(os.path.join(os.path.dirname(nvimgcodec_dir), "nvjpeg/bin"))
-            for minor_version in range(9, -1, -1): # try newer versions first
-                search_paths.append(f"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v{cuda_major_version}.{minor_version}/bin")
-        else: # Linux
-            search_paths.append(os.path.join(os.path.dirname(nvimgcodec_dir), "nvjpeg/lib"))
-            search_paths.append("/usr/local/cuda/lib64/")
-        
-        for path in search_paths:
-            if not os.path.exists(path):
-                continue
-                
-            for file in os.listdir(path):
-                if file.startswith("libnvjpeg.so") or (file.startswith("nvjpeg64_") and file.endswith(".dll")):
-                    try:
-                        nvjpeg_lib = c.CDLL(os.path.join(path, file))
-                        nvjpeg_lib.nvjpegGetProperty(0, c.byref(nvjpeg_ver_major))
-                        nvjpeg_lib.nvjpegGetProperty(1, c.byref(nvjpeg_ver_minor))
-                        nvjpeg_lib.nvjpegGetProperty(2, c.byref(nvjpeg_ver_patch))
-                        nvjpeg_found = True
-                        break
-                    except:
-                        continue
-            if nvjpeg_found:
-                break
+    return 0, 0, 0
 
-    if not nvjpeg_found:
-        return 0, 0, 0
-        
-    return nvjpeg_ver_major.value, nvjpeg_ver_minor.value, nvjpeg_ver_patch.value
 
 def get_cuda_compute_capability(device_id=0):
     compute_cap = 0
@@ -94,9 +94,6 @@ def get_cuda_compute_capability(device_id=0):
 img_dir_path = os.path.abspath(os.path.join(
     os.path.dirname(__file__), "../../resources"))
 
-
-def get_default_decoder_options():
-    return ":fancy_upsampling=1" # this option is always available since cuda 12.1
 
 def get_max_diff_threshold(threshold=None):
     if threshold is not None:
@@ -132,7 +129,7 @@ def is_nvcomp_supported(device_id=0):
     # it is aarch system, nvCOMP is supported for sbsa, but not for tegra,
     # so just check if nvCOMP is installed in the system, by trying to load it
     try:
-        ctypes.CDLL('libnvcomp.so')
+        c.CDLL('libnvcomp.so')
         return True
     except:
         return False

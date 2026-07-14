@@ -17,14 +17,16 @@
 
 #include "decoder.h"
 
+#include <algorithm>
 #include <iostream>
-#include <string_view>
 #include <optional>
+#include <string_view>
 
 #include <ilogger.h>
 #include <log.h>
 
 #include "backend.h"
+#include "device_utils.h"
 #include "error_handling.h"
 #include "imgproc/exception.h"
 #include "imgproc/type_utils.h"
@@ -41,6 +43,7 @@ Decoder::Decoder(nvimgcodecInstance_t instance, ILogger* logger, int device_id, 
     : decoder_(nullptr)
     , instance_(instance)
     , logger_(logger)
+    , device_id_(resolve_device_id(device_id))
 {
     nvimgcodecDecoder_t decoder = nullptr;
     std::vector<nvimgcodecBackend_t> nvimgcds_backends(backends.has_value() ? backends.value().size() : 0);
@@ -151,108 +154,63 @@ std::vector<py::object> Decoder::decode(
             int bytes_per_element = sample_type_to_bytes_per_element(sample_type);
     
             image_info.cuda_stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-    
-            //Decode to format
-            bool decode_to_interleaved = true; //TODO introduce sample_forat param to decode  function and base on it on this code
 
-    
-            if (params.color_spec_ == NVIMGCODEC_COLORSPEC_SRGB) {
-                image_info.sample_format = decode_to_interleaved ? NVIMGCODEC_SAMPLEFORMAT_I_RGB : NVIMGCODEC_SAMPLEFORMAT_P_RGB;
-                image_info.color_spec = NVIMGCODEC_COLORSPEC_SRGB;
-                image_info.plane_info[0].num_channels = decode_to_interleaved ? 3 /*I_RGB*/ : 1 /*P_RGB*/;
-                image_info.num_planes = decode_to_interleaved ? 1 : 3;
-                image_info.chroma_subsampling = NVIMGCODEC_SAMPLING_NONE;
-            } else if (params.color_spec_ == NVIMGCODEC_COLORSPEC_GRAY) {
-                image_info.sample_format = NVIMGCODEC_SAMPLEFORMAT_I_Y;
-                image_info.color_spec = NVIMGCODEC_COLORSPEC_GRAY;
-                image_info.plane_info[0].num_channels = 1;
-                image_info.num_planes = 1;
-                image_info.chroma_subsampling = NVIMGCODEC_SAMPLING_GRAY;
-            } else if (params.color_spec_ == NVIMGCODEC_COLORSPEC_UNCHANGED) {
-                uint32_t num_channels = std::max(image_info.num_planes, image_info.plane_info[0].num_channels);
-                if (image_info.color_spec == NVIMGCODEC_COLORSPEC_GRAY || image_info.color_spec == NVIMGCODEC_COLORSPEC_SRGB) {
-                    //  This is temporary as there is not support for planar output yet so always decode to interleaved
-                    // TODO should be : image_info.sample_format = intentionally not changed as it is specified in decode params
-                    if (decode_to_interleaved) {
-                        switch (image_info.sample_format) {
-                        case NVIMGCODEC_SAMPLEFORMAT_P_Y:
-                        case NVIMGCODEC_SAMPLEFORMAT_I_Y:
-                            image_info.sample_format = NVIMGCODEC_SAMPLEFORMAT_I_Y;
-                            image_info.chroma_subsampling = NVIMGCODEC_SAMPLING_GRAY;
-                            break;
-                        case NVIMGCODEC_SAMPLEFORMAT_I_YA:
-                        case NVIMGCODEC_SAMPLEFORMAT_P_YA:
-                            image_info.sample_format = NVIMGCODEC_SAMPLEFORMAT_I_YA;
-                            image_info.chroma_subsampling = NVIMGCODEC_SAMPLING_GRAY;
-                            break;
-                        case NVIMGCODEC_SAMPLEFORMAT_I_RGB:
-                        case NVIMGCODEC_SAMPLEFORMAT_P_RGB:
-                            image_info.sample_format = NVIMGCODEC_SAMPLEFORMAT_I_RGB;
-                            image_info.chroma_subsampling = NVIMGCODEC_SAMPLING_NONE;
-                            break;
-                        case NVIMGCODEC_SAMPLEFORMAT_I_BGR:
-                        case NVIMGCODEC_SAMPLEFORMAT_P_BGR:
-                            image_info.sample_format = NVIMGCODEC_SAMPLEFORMAT_I_BGR;
-                            image_info.chroma_subsampling = NVIMGCODEC_SAMPLING_NONE;
-                            break;
-                        case NVIMGCODEC_SAMPLEFORMAT_I_YUV:
-                        case NVIMGCODEC_SAMPLEFORMAT_P_YUV:
-                            image_info.sample_format = NVIMGCODEC_SAMPLEFORMAT_I_YUV;
-                            break;
-                        case NVIMGCODEC_SAMPLEFORMAT_I_RGBA:
-                        case NVIMGCODEC_SAMPLEFORMAT_P_RGBA:
-                            image_info.sample_format = NVIMGCODEC_SAMPLEFORMAT_I_RGBA;
-                            image_info.chroma_subsampling = NVIMGCODEC_SAMPLING_NONE;
-                            break;
-                        default:
-                            image_info.sample_format = NVIMGCODEC_SAMPLEFORMAT_I_UNCHANGED;
-                            break;
-                        }
-                    } else {
-                        image_info.sample_format = NVIMGCODEC_SAMPLEFORMAT_P_UNCHANGED;
-                        image_info.chroma_subsampling = num_channels == 1 ? NVIMGCODEC_SAMPLING_GRAY : NVIMGCODEC_SAMPLING_NONE;
-                    }
-                    // image_info.color_spec intentionally not changed as it is specified in decode params
-                } else {
-                    image_info.sample_format = decode_to_interleaved ? NVIMGCODEC_SAMPLEFORMAT_I_UNCHANGED : NVIMGCODEC_SAMPLEFORMAT_P_UNCHANGED;
-                    // TODO Now there is limitation that other input color spaces are not handled correctly so it is not supported yet
-                    // and we have to decode to sRGB
-                    image_info.color_spec = num_channels == 1 ? NVIMGCODEC_COLORSPEC_GRAY : NVIMGCODEC_COLORSPEC_SRGB;
-                    image_info.chroma_subsampling = num_channels == 1 ? NVIMGCODEC_SAMPLING_GRAY : NVIMGCODEC_SAMPLING_NONE;
-                }
-                image_info.plane_info[0].num_channels = decode_to_interleaved ? num_channels : 1;
-                image_info.num_planes = decode_to_interleaved ? 1 : num_channels;
-            } else if (params.color_spec_ == NVIMGCODEC_COLORSPEC_SYCC) {
-                image_info.sample_format = decode_to_interleaved ? NVIMGCODEC_SAMPLEFORMAT_I_YCC : NVIMGCODEC_SAMPLEFORMAT_P_YCC;
-                image_info.color_spec = NVIMGCODEC_COLORSPEC_SYCC;
-                image_info.plane_info[0].num_channels = decode_to_interleaved ? 3 /*I_YUV*/ : 1 /*P_YUV*/;
-                image_info.num_planes = decode_to_interleaved ? 1 : 3;
-                
-            } else {
-                // TODO(janton): support more?
+            // Resolve the desired output format from the user's DecodeParams
+            // (sample_format + color_spec) plus the source's detected metadata.
+            // The resolver enforces compatibility between sample_format and
+            // color_spec and picks layout (interleaved vs planar) and concrete
+            // sample_format / color_spec / component count.
+            int source_num_channels = 0;
+            for (uint32_t c = 0; c < image_info.num_planes; ++c) {
+                source_num_channels += image_info.plane_info[c].num_channels;
             }
+            ResolvedFormat resolved = resolveOutputFormat(
+                params.sample_format_,
+                params.color_spec_,
+                image_info.sample_format,
+                image_info.color_spec,
+                source_num_channels);
+
+            image_info.sample_format = resolved.sample_format;
+            image_info.color_spec    = resolved.color_spec;
+            image_info.num_planes    = resolved.is_interleaved ? 1u : static_cast<uint32_t>(resolved.num_components);
+
+            // chroma_subsampling is only ever GRAY or NONE: GRAY for
+            // single-luma outputs, NONE (chroma co-sampled with luma -
+            // equivalent to 4:4:4) for everything else. Sub-sampled chroma
+            // from the source codestream is not propagated, even for
+            // planar outputs, so downstream consumers can rely on the
+            // decoder's chroma_subsampling being one of these two values.
+            const nvimgcodecColorSpec_t resolved_family = sample_format_color_family(resolved.sample_format);
+            const bool is_luma_only =
+                resolved_family == NVIMGCODEC_COLORSPEC_GRAY ||
+                resolved.num_components == 1;
+            image_info.chroma_subsampling =
+                is_luma_only ? NVIMGCODEC_SAMPLING_GRAY : NVIMGCODEC_SAMPLING_NONE;
     
             int decode_out_height = image_info.plane_info[0].height;
             int decode_out_width = image_info.plane_info[0].width;
+            const bool swap_wh = params.decode_params_.apply_exif_orientation && ((image_info.orientation.rotated / 90) % 2);
             if (roi) {
+                // When apply_exif_orientation is on, the region is already in display
+                // (post-orientation) coords, so its extent is the output buffer size and
+                // does not need an additional swap. When apply_exif_orientation is off,
+                // the region is in codestream coords; output dims also match without swap.
                 nvimgcodecRegion_t region = static_cast<nvimgcodecRegion_t>(roi.value());
                 decode_out_height = region.end[0] - region.start[0];
                 decode_out_width = region.end[1] - region.start[1];
-            }
-            bool swap_wh = params.decode_params_.apply_exif_orientation && ((image_info.orientation.rotated / 90) % 2);
-            if (swap_wh) {
+            } else if (swap_wh) {
                 std::swap(decode_out_height, decode_out_width);
             }
 
-            size_t device_pitch_in_bytes = decode_out_width * bytes_per_element * image_info.plane_info[0].num_channels;
-
             for (uint32_t c = 0; c < image_info.num_planes; ++c) {
-                image_info.plane_info[c].height = decode_out_height;
-                image_info.plane_info[c].width = decode_out_width;
-                image_info.plane_info[c].row_stride = device_pitch_in_bytes;
-                image_info.plane_info[c].sample_type = sample_type;
-                image_info.plane_info[c].precision = precision;
-                image_info.plane_info[c].num_channels = image_info.plane_info[0].num_channels;
+                auto & plane_info = image_info.plane_info[c];
+                plane_info.height = decode_out_height;
+                plane_info.width = decode_out_width;
+                plane_info.sample_type = sample_type;
+                plane_info.precision = precision;
+                plane_info.num_channels = resolved.is_interleaved ? static_cast<uint32_t>(resolved.num_components) : 1u;
+                plane_info.row_stride = static_cast<size_t>(decode_out_width) * bytes_per_element * plane_info.num_channels;
             }
             image_info.buffer = nullptr;
             image_info.buffer_kind = is_cpu_only_ ? NVIMGCODEC_IMAGE_BUFFER_KIND_STRIDED_HOST : NVIMGCODEC_IMAGE_BUFFER_KIND_STRIDED_DEVICE;
@@ -280,7 +238,7 @@ std::vector<py::object> Decoder::decode(
                     orig_sample_idx.push_back(i);
                 } else {
                     // Create new Image
-                    Image img(instance_, logger_, &image_info);
+                    Image img(instance_, logger_, &image_info, device_id_);
                     images.push_back(img.getNvImgCdcsImage());
                     code_streams.push_back(code_stream->handle());
                     py_images.push_back(py::cast(std::move(img)));
@@ -288,7 +246,7 @@ std::vector<py::object> Decoder::decode(
                 }
             } catch (const std::invalid_argument& e) {
                 py::gil_scoped_acquire acquire;
-                throw e;
+                throw;
             } catch (const std::exception& e) {
                 NVIMGCODEC_LOG_WARNING(logger_, "Something went wrong during decoding image #" << i << " (" << e.what() << "). There will be None on corresponding output position");
                 py::gil_scoped_acquire acquire;
@@ -297,7 +255,7 @@ std::vector<py::object> Decoder::decode(
             }
         } catch (const std::invalid_argument& e) {
             py::gil_scoped_acquire acquire;
-            throw e;
+            throw;
         } catch (const std::exception& e) {
             NVIMGCODEC_LOG_WARNING(logger_, "Could not parse input bitstream #" << i << " (" << e.what() << "). There will be None on corresponding output position");
             py::gil_scoped_acquire acquire;
@@ -338,6 +296,11 @@ std::vector<py::object> Decoder::decode(
 
     }
     return py_images;
+}
+
+int Decoder::getDeviceId() const
+{
+    return device_id_;
 }
 
 py::object Decoder::enter()
@@ -484,12 +447,11 @@ void Decoder::exportToPython(py::module& m, nvimgcodecInstance_t instance, ILogg
                     for options that apply only to a specific decoder (e.g.
                     ``nvjpeg_cuda_decoder:hybrid_huffman_threshold=0``). See the documentation
                     section "Decoder options format" for the full list of options per decoder.
-                    Default is ``":fancy_upsampling=0"``; pass ``""`` to use library defaults (e.g.
-                    fancy upsampling enabled).
+                    Default is ``""`` which keeps each extension defaults.
 
             )pbdoc",
             "device_id"_a = NVIMGCODEC_DEVICE_CURRENT, "max_num_cpu_threads"_a = 0, "backends"_a = py::none(),
-            "options"_a = ":fancy_upsampling=0")
+            "options"_a = "")
         .def("read", py::overload_cast<const CodeStream*, std::optional<Image*>, std::optional<DecodeParams>, intptr_t>(&Decoder::decode), R"pbdoc(
             Executes decoding from a CodeStream (typically created from a file).
 
@@ -595,6 +557,10 @@ void Decoder::exportToPython(py::module& m, nvimgcodecInstance_t instance, ILogg
             )pbdoc",
             "code_stream"_a, py::kw_only(), "id"_a, "kind"_a = NVIMGCODEC_METADATA_KIND_TIFF_TAG)
 
+        .def_property_readonly("device_id", &Decoder::getDeviceId,
+            R"pbdoc(
+            The CUDA device id this decoder executes on.
+            )pbdoc")
         .def("__enter__", &Decoder::enter, "Enter the runtime context related to this decoder.")
         .def("__exit__", &Decoder::exit, "Exit the runtime context related to this decoder and releases allocated resources.",
             "exc_type"_a = py::none(), "exc_value"_a = py::none(), "traceback"_a = py::none());

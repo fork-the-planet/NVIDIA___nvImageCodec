@@ -147,3 +147,24 @@ def test_dlpack_import_and_reexport():
     # Delete the nvimgcodec Image - both original and buffer should still be valid
     del img
     np.testing.assert_array_equal(cp.asnumpy(original), cp.asnumpy(buffer))
+
+
+def test_dlpack_import_rejects_non_row_only_strides():
+    """DLPack tensors with non-row-only strides must be rejected at import.
+
+    The cross-device path in Image.cuda() performs a flat cudaMemcpyPeerAsync
+    over height * row_stride bytes; a tensor with a non-trivial inner stride
+    would silently copy non-image memory. The __cuda_array_interface__ path
+    already enforces this via is_padding_correct; this is the DLPack analog.
+    """
+    # Allocate a contiguous HWC buffer with 6 channels, then take every other
+    # channel via slicing. This yields a tensor with strides[2] = 2 elements
+    # (instead of 1) -- exactly the "non-row-only stride" case the CAI guard
+    # already rejects.
+    base = cp.zeros((48, 64, 6), dtype=cp.uint8)
+    strided = base[..., ::2]
+    assert strided.strides[2] != strided.itemsize  # sanity: non-contiguous in channels
+
+    capsule = strided.toDlpack()
+    with t.raises(RuntimeError):
+        nvimgcodec.as_image(capsule)

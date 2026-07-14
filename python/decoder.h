@@ -54,6 +54,8 @@ class Decoder
     py::object getMetadata(const CodeStream& code_stream, std::optional<nvimgcodecMetadataKind_t> kind = std::nullopt);
     std::optional<Metadata> getMetadata(const CodeStream& code_stream, int id, nvimgcodecMetadataKind_t kind = NVIMGCODEC_METADATA_KIND_TIFF_TAG);
 
+    int getDeviceId() const;
+
     py::object enter();
     void exit(const std::optional<pybind11::type>& exc_type, const std::optional<pybind11::object>& exc_value,
         const std::optional<pybind11::object>& traceback);
@@ -67,6 +69,7 @@ class Decoder
     std::shared_ptr<std::remove_pointer<nvimgcodecDecoder_t>::type> decoder_;
     nvimgcodecInstance_t instance_;
     ILogger* logger_;
+    int device_id_;
 
     bool is_cpu_only_ = false;
 };

@@ -15,3 +15,5 @@
 *.pbm -text
 *.pgm -text
 *.dcm filter=lfs diff=lfs merge=lfs -text
+*.bat text eol=crlf
+*.pfm filter=lfs diff=lfs merge=lfs -text

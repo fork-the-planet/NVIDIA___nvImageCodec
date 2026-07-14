@@ -290,6 +290,7 @@ nvimgcodecStatus_t JPEG2KParserPlugin::Parser::parseJP2(nvimgcodecIoStreamDesc_t
                     height = ReadValueBE<uint32_t>(io_stream);
                     width = ReadValueBE<uint32_t>(io_stream);
                     num_components = ReadValueBE<uint16_t>(io_stream);
+                    has_ihdr = true;
 
                     if (num_components > NVIMGCODEC_MAX_NUM_PLANES) {
                         NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Too many components " << num_components);
@@ -420,6 +421,10 @@ nvimgcodecStatus_t JPEG2KParserPlugin::Parser::parseCodeStream(nvimgcodecIoStrea
                 << (int)bits_per_component << ", got " << (int)Ssiz[i]);
             return NVIMGCODEC_STATUS_CODESTREAM_UNSUPPORTED;
         }
+        if (XRSiz[i] == 0 || YRSiz[i] == 0) {
+            NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Component " << i << ", XRSiz or YRSiz is 0, but should be at least 1.");
+            return NVIMGCODEC_STATUS_BAD_CODESTREAM;
+        }
     }
     return NVIMGCODEC_STATUS_SUCCESS;
 }
@@ -443,7 +448,9 @@ nvimgcodecStatus_t JPEG2KParserPlugin::Parser::getImageInfo(nvimgcodecImageInfo_
         CHECK_NULL(code_stream);
         CHECK_NULL(image_info);
         num_components = 0;
-        height = 0xFFFFFFFF, width = 0xFFFFFFFF;
+        height = 0;
+        width = 0;
+        has_ihdr = false;
         bits_per_component = DIFFERENT_BITDEPTH_PER_COMPONENT;
         // Initialize to UNKNOWN; parseJP2 relies on this to process only the first colr box
         // per ISO/IEC 15444-1 (if multiple colr boxes exist, use the first)
@@ -495,6 +502,29 @@ nvimgcodecStatus_t JPEG2KParserPlugin::Parser::getImageInfo(nvimgcodecImageInfo_
         if (CSiz != num_components) {
             NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Unexpected number of components in main header versus image header box");
             return NVIMGCODEC_STATUS_BAD_CODESTREAM;
+        }
+
+        // Reject malformed SIZ offsets before they are used in unsigned subtractions below
+        // (XSiz - XOSiz, YSiz - YOSiz) which would otherwise wrap and produce huge plane
+        // geometry. Applies to both JP2 and bare J2K codestream paths.
+        if (XOSiz > XSiz || YOSiz > YSiz) {
+            NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Invalid SIZ offsets: XOSiz=" << XOSiz << ", XSiz=" << XSiz
+                << ", YOSiz=" << YOSiz << ", YSiz=" << YSiz);
+            return NVIMGCODEC_STATUS_BAD_CODESTREAM;
+        }
+
+        // If a JP2 ihdr box was parsed, additionally make sure its declared image dimensions
+        // match the codestream SIZ marker. A mismatch is a malformed-input vector: decoders
+        // that re-parse the JP2 (e.g. OpenCV's openjpeg fallback for JPEG 2000) may size
+        // buffers from one source and write using the other, crashing the process.
+        if (has_ihdr) {
+            const uint32_t cs_width  = XSiz - XOSiz;
+            const uint32_t cs_height = YSiz - YOSiz;
+            if (width != cs_width || height != cs_height) {
+                NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "JP2 ihdr dimensions (" << width << "x" << height
+                    << ") do not match codestream SIZ (" << cs_width << "x" << cs_height << ")");
+                return NVIMGCODEC_STATUS_BAD_CODESTREAM;
+            }
         }
         if (color_spec == NVIMGCODEC_COLORSPEC_SRGB || color_spec == NVIMGCODEC_COLORSPEC_UNKNOWN || color_spec == NVIMGCODEC_COLORSPEC_UNCHANGED)  {
         switch (num_components) {

@@ -93,10 +93,7 @@ public:
     nvimgcodecSampleFormat_t sample_format;
 };
 
-TEST_P(LibjpegTurboExtDecoderTestWithPathAndFormat, SingleImage)
-{
-    TestSingleImage(image_path, sample_format);
-}
+DEFINE_SINGLE_IMAGE_STRIDE_TESTS(LibjpegTurboExtDecoderTestWithPathAndFormat)
 
 INSTANTIATE_TEST_SUITE_P(LIBJPEG_TURBO_DECODE_420,
     LibjpegTurboExtDecoderTestWithPathAndFormat,

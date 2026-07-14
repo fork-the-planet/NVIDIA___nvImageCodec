@@ -19,6 +19,7 @@
 #include "code_stream.h"
 
 #include <string.h>
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <optional>
@@ -30,6 +31,7 @@
 
 #include "../src/file_ext_codec.h"
 #include "backend.h"
+#include "device_utils.h"
 #include "error_handling.h"
 #include "imgproc/exception.h"
 
@@ -37,11 +39,30 @@ namespace fs = std::filesystem;
 
 namespace nvimgcodec {
 
+namespace {
+
+// Chooses the chroma subsampling to use when the caller didn't specify one.
+// Images with at least 3 channels use 4:2:0 for JPEG - it is the broadly
+// compatible choice and the only mode the nvJPEG hardware encoder accepts -
+// and full-resolution 4:4:4 for other codecs. Images with fewer than 3 channels
+// (grayscale and grayscale+alpha) default to grayscale.
+nvimgcodecChromaSubsampling_t default_chroma_subsampling(const std::string& codec_name, uint32_t total_channels)
+{
+    if (total_channels < 3)
+        return NVIMGCODEC_SAMPLING_GRAY;
+    if (codec_name == "jpeg")
+        return NVIMGCODEC_SAMPLING_420;
+    return NVIMGCODEC_SAMPLING_444;
+}
+
+} // namespace
+
 Encoder::Encoder(nvimgcodecInstance_t instance, ILogger* logger, int device_id, int max_num_cpu_threads,
     std::optional<std::vector<Backend>> backends, const std::string& options)
     : encoder_(nullptr)
     , instance_(instance)
     , logger_(logger)
+    , device_id_(resolve_device_id(device_id))
 {
     std::vector<nvimgcodecBackend_t> nvimgcds_backends(backends.has_value() ? backends->size() : 0);
     if (backends.has_value()) {
@@ -58,6 +79,15 @@ Encoder::Encoder(nvimgcodecInstance_t instance, ILogger* logger, int device_id, 
     exec_params.num_backends = nvimgcds_backends.size();
     exec_params.backends = backends_ptr;
 
+    is_cpu_only_ = device_id_ == NVIMGCODEC_DEVICE_CPU_ONLY;
+    if (!is_cpu_only_ && nvimgcds_backends.size() > 0) {
+        is_cpu_only_ = true;
+        for (size_t i = 0; is_cpu_only_ && i < nvimgcds_backends.size(); ++i) {
+            if (nvimgcds_backends[i].kind != NVIMGCODEC_BACKEND_KIND_CPU_ONLY)
+                is_cpu_only_ = false;
+        }
+    }
+
     nvimgcodecStatus_t status = nvimgcodecEncoderCreate(instance, &encoder, &exec_params, options.c_str());
     if (status != NVIMGCODEC_STATUS_SUCCESS) {
         throw Exception(INTERNAL_ERROR, "Could not create encoder. Code: " + std::to_string(status));
@@ -72,6 +102,7 @@ Encoder::~Encoder()
 }
 
 void Encoder::encode_batch_impl(const std::vector<const Image*>& images, const std::optional<EncodeParams>& params_opt, intptr_t cuda_stream,
+    const std::vector<std::string>& codec_names,
     std::function<void(size_t i, nvimgcodecImageInfo_t& out_image_info, nvimgcodecCodeStream_t* code_stream)> create_code_stream,
     std::function<void(size_t i, bool skip_item)> post_encode_call_back)
 {
@@ -94,16 +125,18 @@ void Encoder::encode_batch_impl(const std::vector<const Image*>& images, const s
             nvimgcodecImageGetImageInfo(valid_images.back(), &image_info);
 
             nvimgcodecImageInfo_t out_image_info(image_info);
-            
-            // Set chroma_subsampling: use user-specified value if provided,
-            // otherwise default to GRAY for single-channel images, 444 for multi-channel
+
+            // chroma_subsampling: caller's value wins; otherwise pick a codec
+            // dependent default per image (the codec can differ per image when
+            // writing to files with different extensions). Total channel count is
+            // num_planes for planar (one channel per plane) and
+            // plane[0].num_channels for interleaved - max() covers both.
             if (params.chroma_subsampling_.has_value()) {
                 out_image_info.chroma_subsampling = params.chroma_subsampling_.value();
             } else {
-                uint32_t num_channels = image_info.plane_info[0].num_channels;
-                out_image_info.chroma_subsampling = (num_channels < 3) 
-                    ? NVIMGCODEC_SAMPLING_GRAY 
-                    : NVIMGCODEC_SAMPLING_444;
+                const uint32_t total_channels =
+                    std::max(image_info.num_planes, image_info.plane_info[0].num_channels);
+                out_image_info.chroma_subsampling = default_chroma_subsampling(codec_names[i], total_channels);
             }
             
             if (params.color_spec_ != NVIMGCODEC_COLORSPEC_UNCHANGED) {
@@ -162,7 +195,7 @@ std::vector<py::object> Encoder::encode_batch(const std::vector<const Image*>& i
             code_streams.value()[i]->reuse(out_image_info); 
             *code_stream = code_streams.value()[i]->handle(); 
         } else {
-            new_code_streams[i] = std::make_unique<CodeStream>(instance_, logger_, out_image_info);
+            new_code_streams[i] = std::make_unique<CodeStream>(instance_, logger_, out_image_info, !is_cpu_only_);
             *code_stream = new_code_streams[i]->handle();
         }
     };
@@ -180,7 +213,10 @@ std::vector<py::object> Encoder::encode_batch(const std::vector<const Image*>& i
         }
     };
 
-    encode_batch_impl(images, params, cuda_stream, create_code_stream, post_encode_callback);
+    // encode() targets a single codec for the whole batch.
+    std::vector<std::string> codec_names(orig_batch_size, codec_name);
+
+    encode_batch_impl(images, params, cuda_stream, codec_names, create_code_stream, post_encode_callback);
 
     return data_list;
 }
@@ -276,24 +312,34 @@ std::vector<py::object> Encoder::write_batch(const std::vector<std::string>& fil
     std::vector<CodeStream> code_streams;
     code_streams.reserve(images.size());
 
-    auto create_code_stream = [&](size_t i, nvimgcodecImageInfo_t& out_image_info, nvimgcodecCodeStream_t* code_stream) -> void {
-        std::string codec_name{};
-
+    // Resolve the codec per file: the codec (and therefore the chroma-subsampling
+    // default) can differ from image to image when writing to file names with
+    // different extensions. Resolved up front so the value is shared between the
+    // chroma-subsampling default and code stream creation, with any fallback
+    // warning logged once per (valid) item.
+    std::vector<std::string> codec_names(orig_batch_size);
+    for (size_t i = 0; i < orig_batch_size; ++i) {
+        if (!images[i])
+            continue; // skipped items never reach create_code_stream / the chroma default
+        std::string& item_codec_name = codec_names[i];
         if (codec.empty()) {
             auto file_extension = fs::path(file_names[i]).extension();
-            codec_name = file_ext_to_codec(file_extension.string().c_str());
-            if (codec_name.empty()) {
+            item_codec_name = file_ext_to_codec(file_extension.string().c_str());
+            if (item_codec_name.empty()) {
                 NVIMGCODEC_LOG_WARNING(logger_, "File '" << file_names[i] << "' without extension. As default choosing jpeg codec");
-                codec_name = "jpeg";
+                item_codec_name = "jpeg";
             }
         } else {
-            codec_name = codec[0] == '.' ? file_ext_to_codec(codec) : codec;
-            if (codec_name.empty()) {
+            item_codec_name = codec[0] == '.' ? file_ext_to_codec(codec) : codec;
+            if (item_codec_name.empty()) {
                 NVIMGCODEC_LOG_WARNING(logger_, "Unsupported codec.  As default choosing jpeg codec");
-                codec_name = "jpeg";
+                item_codec_name = "jpeg";
             }
         }
-        strcpy(out_image_info.codec_name, codec_name.c_str());
+    }
+
+    auto create_code_stream = [&](size_t i, nvimgcodecImageInfo_t& out_image_info, nvimgcodecCodeStream_t* code_stream) -> void {
+        strcpy(out_image_info.codec_name, codec_names[i].c_str());
         code_streams.emplace_back(instance_, logger_, file_names[i], out_image_info);
         *code_stream = code_streams.back().handle();
     };
@@ -305,8 +351,8 @@ std::vector<py::object> Encoder::write_batch(const std::vector<std::string>& fil
             encoded_files[i] = py::str(file_names[i]);
         }
     };
-    encode_batch_impl(images, params, cuda_stream, create_code_stream, post_encode_callback);
-    
+    encode_batch_impl(images, params, cuda_stream, codec_names, create_code_stream, post_encode_callback);
+
     return encoded_files;
 }
 
@@ -381,6 +427,11 @@ std::vector<const Image*> Encoder::convertPyObjectsToImages(const std::vector<py
     }
 
     return image_ptrs;
+}
+
+int Encoder::getDeviceId() const
+{
+    return device_id_;
 }
 
 py::object Encoder::enter()
@@ -487,6 +538,10 @@ void Encoder::exportToPython(py::module& m, nvimgcodecInstance_t instance, ILogg
                 List of encoded file names. If an image could not be encoded for any reason, the corresponding position in the list will contain None.
             )pbdoc",
             "file_names"_a, "images"_a, "codec"_a = "", "params"_a = py::none(), "cuda_stream"_a = 0)
+        .def_property_readonly("device_id", &Encoder::getDeviceId,
+            R"pbdoc(
+            The CUDA device id this encoder executes on.
+            )pbdoc")
         .def("__enter__", &Encoder::enter, "Enter the runtime context related to this encoder.")
         .def("__exit__", &Encoder::exit,
             "Exit the runtime context related to this encoder and releases allocated resources.",

@@ -55,14 +55,14 @@ if (BUILD_NVJPEG2K_EXT)
         include(FetchContent)
         FetchContent_Declare(
             nvjpeg2k_headers
-            URL      https://developer.download.nvidia.com/compute/nvjpeg2000/redist/libnvjpeg_2k/linux-x86_64/libnvjpeg_2k-linux-x86_64-0.10.0.49_cuda12-archive.tar.xz
-            URL_HASH SHA512=29653927671913bbac8be5dc755c5ca16d63237f96c75a8beb3d05225c1a237f3848af9c3b9b6594970eb7f2f6d405df077aa741dafb4476f64996d7da8dd49d
+            URL      https://developer.download.nvidia.com/compute/nvjpeg2000/redist/libnvjpeg_2k/linux-x86_64/libnvjpeg_2k-linux-x86_64-0.11.0.51_cuda12-archive.tar.xz
+            URL_HASH SHA512=20412e9adae2645652c6e2c18f8fdff67acb7ed6d4b952e116378b51d59c36b86ed3e13e2bff176c36f8b0fbad588a6540f538f4d599ffa54c1cce7461fc0192
         )
         FetchContent_Populate(nvjpeg2k_headers)
         set(NVJPEG2K_SEARCH_PATHS "${nvjpeg2k_headers_SOURCE_DIR}/include")
     else()
         set(NVJPEG2K_SEARCH_PATHS ${CTK_SEARCH_PATHS})
-        find_library(NVJPEG2K_LIBRARY nvjpeg2k_static PATH_SUFFIXES lib lib64)
+        find_library(NVJPEG2K_LIBRARY ${NVJPEG2K_LIB_NAME} PATH_SUFFIXES lib lib64)
         if(NVJPEG2K_LIBRARY)
             message(STATUS "Found nvJPEG2k: ${NVJPEG2K_LIBRARY}")
         else()
@@ -93,14 +93,14 @@ if (BUILD_NVTIFF_EXT)
         include(FetchContent)
         FetchContent_Declare(
            nvtiff_headers
-           URL      https://developer.download.nvidia.com/compute/nvtiff/redist/libnvtiff/linux-x86_64/libnvtiff-linux-x86_64-0.7.0.79_cuda12-archive.tar.xz
-           URL_HASH SHA512=7949894d0f0bb5e317c74db7a193a55d7eea492cc629dde5898c83f4077481a225e06d12e5c64f9d566cfc9e2ff3b6ca973d1b80647d6c32223827b06e2b02f4
+           URL      https://developer.download.nvidia.com/compute/nvtiff/redist/libnvtiff/linux-x86_64/libnvtiff-linux-x86_64-0.8.0.82_cuda12-archive.tar.xz
+           URL_HASH SHA512=6eea339a73a1ea306532a5f75b8a7b959ce7653c805cac855e050d5a00073a4bd46d3d69e8d84a367e42199495b634bb855fe99234cbe2d828b19df93a00ac25
         )
         FetchContent_Populate(nvtiff_headers)
         set(NVTIFF_SEARCH_PATHS "${nvtiff_headers_SOURCE_DIR}/include")
     else()
         set(NVTIFF_SEARCH_PATHS ${CTK_SEARCH_PATHS})
-        find_library(NVTIFF_LIB nvtiff_static PATH_SUFFIXES lib lib64)
+        find_library(NVTIFF_LIB ${NVTIFF_LIB_NAME} PATH_SUFFIXES lib lib64)
         if(NVTIFF_LIB)
             message(STATUS "Found nvTIFF: ${NVTIFF_LIB}")
         else()
@@ -123,35 +123,16 @@ if (BUILD_NVTIFF_EXT)
     message(STATUS "Using NVTIFF_INCLUDE=${NVTIFF_INCLUDE}")
     include_directories(BEFORE SYSTEM ${NVTIFF_INCLUDE})
 
-    # When linking statically, detect at configure time which nvtiff "Ex" APIs are available (header + lib).
-    if (NOT WITH_DYNAMIC_NVTIFF AND NVTIFF_LIB AND NVTIFF_INCLUDE)
-        set(_nvtiff_check_src "${CMAKE_BINARY_DIR}/nvtiff_check_src")
-        file(MAKE_DIRECTORY "${_nvtiff_check_src}")
-        macro(_nvtiff_try_symbol _result_var _symbol _name)
-            file(WRITE "${_nvtiff_check_src}/${_name}.cpp"
-                "/* Compile+link check for ${_symbol} */\n"
-                "#include <nvtiff.h>\n"
-                "int main() { (void)(void *)${_symbol}; return 0; }\n")
-            file(WRITE "${_nvtiff_check_src}/CMakeLists.txt"
-                "cmake_minimum_required(VERSION 3.18)\n"
-                "project(${_name} NONE CXX)\n"
-                "include_directories(\${NVTIFF_INCLUDE})\n"
-                "add_executable(${_name} ${_name}.cpp)\n"
-                "target_link_libraries(${_name} PRIVATE \${NVTIFF_LIB})\n")
-            try_compile(${_result_var}
-                "${CMAKE_BINARY_DIR}/${_name}" "${_nvtiff_check_src}"
-                ${_name} ${_name}
-                CMAKE_FLAGS "-DNVTIFF_INCLUDE=${NVTIFF_INCLUDE}" "-DNVTIFF_LIB=${NVTIFF_LIB}")
-            if(${_result_var})
-                message(STATUS "nvtiff (static): ${_symbol} available")
-            else()
-                message(STATUS "nvtiff (static): ${_symbol} not available")
-            endif()
-        endmacro()
-        _nvtiff_try_symbol(NVTIFF_HAS_DECODE_IMAGE_EX nvtiffDecodeImageEx check_decode_ex)
-        _nvtiff_try_symbol(NVTIFF_HAS_STREAM_PARSE_EX nvtiffStreamParseEx check_parse_ex)
-        _nvtiff_try_symbol(NVTIFF_HAS_STREAM_GET_NUMBER_OF_TAGS nvtiffStreamGetNumberOfTags check_get_num_tags)
-        _nvtiff_try_symbol(NVTIFF_HAS_STREAM_HAS_TAG nvtiffStreamHasTag check_has_tag)
+    file(READ "${NVTIFF_INCLUDE}/nvtiff_version.h" _nvtiff_version_header)
+    string(REGEX MATCH "#define[ \t]+NVTIFF_VER_MAJOR[ \t]+([0-9]+)" _nvtiff_major_match "${_nvtiff_version_header}")
+    set(_nvtiff_major "${CMAKE_MATCH_1}")
+    string(REGEX MATCH "#define[ \t]+NVTIFF_VER_MINOR[ \t]+([0-9]+)" _nvtiff_minor_match "${_nvtiff_version_header}")
+    set(_nvtiff_minor "${CMAKE_MATCH_1}")
+    if (NOT _nvtiff_major_match OR NOT _nvtiff_minor_match)
+        message(FATAL_ERROR "Could not parse nvTIFF header version from ${NVTIFF_INCLUDE}/nvtiff_version.h")
+    endif()
+    if (_nvtiff_major EQUAL 0 AND _nvtiff_minor LESS 8)
+        message(FATAL_ERROR "nvTIFF >= 0.8 is required. Found ${_nvtiff_major}.${_nvtiff_minor}.")
     endif()
 else()
     message(STATUS "nvTIFF extension build disabled")
@@ -221,6 +202,78 @@ if (NOT DEFINED OpenCV_VERSION AND (BUILD_OPENCV_EXT OR BUILD_TEST))
         message(STATUS "Found OpenCV: ${OpenCV_INCLUDE_DIRS} (found suitable version \"${OpenCV_VERSION}\", minimum required is \"4.9\")")
         message(STATUS "OpenCV libraries: ${OpenCV_LIBRARIES}")
         include_directories(SYSTEM ${OpenCV_INCLUDE_DIRS})
+
+        if(WIN32)
+            set(NVIMGCODEC_OPENCV_RUNTIME_DLLS "")
+            set(_opencv_runtime_search_dirs "")
+
+            foreach(_opencv_dir_var IN ITEMS OpenCV_BIN_DIR OpenCV_RUNTIME_DIR)
+                if(DEFINED ${_opencv_dir_var})
+                    set(_opencv_dir_value "${${_opencv_dir_var}}")
+                    if(_opencv_dir_value)
+                        list(APPEND _opencv_runtime_search_dirs "${_opencv_dir_value}")
+                    endif()
+                endif()
+            endforeach()
+
+            if(DEFINED OpenCV_INSTALL_PATH)
+                list(APPEND _opencv_runtime_search_dirs
+                    "${OpenCV_INSTALL_PATH}/bin"
+                    "${OpenCV_INSTALL_PATH}/x64/vc17/bin"
+                    "${OpenCV_INSTALL_PATH}/x64/vc16/bin"
+                    "${OpenCV_INSTALL_PATH}/x64/vc15/bin")
+            endif()
+
+            if(DEFINED OpenCV_DIR)
+                list(APPEND _opencv_runtime_search_dirs
+                    "${OpenCV_DIR}/../bin"
+                    "${OpenCV_DIR}/../../bin"
+                    "${OpenCV_DIR}/../../../bin")
+            endif()
+
+            foreach(_opencv_lib IN LISTS OpenCV_LIBRARIES)
+                if(TARGET ${_opencv_lib})
+                    foreach(_opencv_target_prop IN ITEMS
+                        IMPORTED_LOCATION
+                        IMPORTED_LOCATION_RELEASE
+                        IMPORTED_LOCATION_RELWITHDEBINFO
+                        IMPORTED_LOCATION_MINSIZEREL
+                        IMPORTED_IMPLIB
+                        IMPORTED_IMPLIB_RELEASE
+                        IMPORTED_IMPLIB_RELWITHDEBINFO
+                        IMPORTED_IMPLIB_MINSIZEREL)
+                        get_target_property(_opencv_target_path ${_opencv_lib} ${_opencv_target_prop})
+                        if(_opencv_target_path AND NOT _opencv_target_path MATCHES "NOTFOUND")
+                            if(_opencv_target_path MATCHES "\\.dll$")
+                                list(APPEND NVIMGCODEC_OPENCV_RUNTIME_DLLS "${_opencv_target_path}")
+                            else()
+                                get_filename_component(_opencv_target_dir "${_opencv_target_path}" DIRECTORY)
+                                list(APPEND _opencv_runtime_search_dirs
+                                    "${_opencv_target_dir}"
+                                    "${_opencv_target_dir}/../bin"
+                                    "${_opencv_target_dir}/../../bin")
+                            endif()
+                        endif()
+                    endforeach()
+                endif()
+            endforeach()
+
+            if(_opencv_runtime_search_dirs)
+                list(REMOVE_DUPLICATES _opencv_runtime_search_dirs)
+            endif()
+
+            foreach(_opencv_runtime_dir IN LISTS _opencv_runtime_search_dirs)
+                if(EXISTS "${_opencv_runtime_dir}")
+                    file(GLOB _opencv_runtime_dlls CONFIGURE_DEPENDS "${_opencv_runtime_dir}/opencv_*.dll")
+                    list(APPEND NVIMGCODEC_OPENCV_RUNTIME_DLLS ${_opencv_runtime_dlls})
+                endif()
+            endforeach()
+
+            if(NVIMGCODEC_OPENCV_RUNTIME_DLLS)
+                list(REMOVE_DUPLICATES NVIMGCODEC_OPENCV_RUNTIME_DLLS)
+                message(STATUS "OpenCV runtime DLLs: ${NVIMGCODEC_OPENCV_RUNTIME_DLLS}")
+            endif()
+        endif()
     endif()
 endif()
 

@@ -36,7 +36,7 @@
 #include "imgproc/convert_kernel_gpu.h"
 #include "imgproc/device_buffer.h"
 #include "imgproc/pinned_buffer.h"
-#include "imgproc/device_guard.h"
+#include "imgproc/image_info_checks.h"
 #include "imgproc/sample_format_utils.h"
 #include "imgproc/stream_device.h"
 #include "imgproc/type_utils.h"
@@ -150,10 +150,18 @@ PerThreadResources::PerThreadResources(const nvimgcodecFrameworkDesc_t* framewor
 Encoder::
 PerThreadResources::~PerThreadResources()
 {
-    cudaStream_t stream = cuda_stream_ ? cuda_stream_.value() : nullptr;
+    // encode_params_ is created unconditionally in the constructor, so it must
+    // be destroyed unconditionally as well; encoder_ is set together with
+    // cuda_stream_ in encoder(), and is only valid when both are populated.
+    // Fall back to the default stream (0) when no per-thread stream was ever
+    // assigned, so the unconditional encode_params_ teardown still has a valid
+    // stream to pass to nvtiff.
+    cudaStream_t stream = cuda_stream_.value_or(cudaStream_t{0});
     if (stream) {
         XM_CUDA_LOG_DESTROY(cudaStreamSynchronize(stream));
-        XM_NVTIFF_LOG_DESTROY(nvtiffEncodeParamsDestroy(encode_params_, stream));
+    }
+    XM_NVTIFF_LOG_DESTROY(nvtiffEncodeParamsDestroy(encode_params_, stream));
+    if (encoder_) {
         XM_NVTIFF_LOG_DESTROY(nvtiffEncoderDestroy(encoder_, stream));
     }
 }
@@ -335,6 +343,10 @@ Encoder::check_image_info(const nvimgcodecImageInfo_t& img_info,
         status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
     }
 
+    if (!nvimgcodec::check_planes_consistency(framework_, plugin_id_, img_info)) {
+        status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
+    }
+
     // The >> 11 gives the number of bytes for the type
     if (plane.row_stride != plane.width * (plane.sample_type >> 11) * plane.num_channels) {
         NVIMGCODEC_LOG_WARNING(framework_, plugin_id_,
@@ -512,6 +524,9 @@ Encoder::encode(const nvimgcodecCodeStreamDesc_t* code_stream,
             image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_IMAGE_CORRUPTED);
             return ret;
         }
+
+        nvimgcodec::warn_if_custom_precision_unsupported(framework_, plugin_id_, img_info);
+
         set_tiff_image_info(img_info, *params, &t.tiff_info_);
         XM_CHECK_NVTIFF(nvtiffEncodeParamsSetImageInfo(t.encode_params_, &t.tiff_info_));
         XM_CHECK_NVTIFF(nvtiffEncodeParamsSetInputs(t.encode_params_, (uint8_t**)&img_info.buffer, 1));

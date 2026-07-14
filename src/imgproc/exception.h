@@ -85,7 +85,11 @@ class Exception : public std::exception
             _error << "CUDA Runtime failure '#" << std::to_string(_e) << "'"   \
                 << " : " << cudaGetErrorString(_e);                            \
             cudaGetLastError(); /* clean that error for any further calls */   \
-            FatalError(CUDA_CALL_ERROR, _error.str());                         \
+            if (_e == cudaErrorMemoryAllocation) {                             \
+                FatalError(ALLOCATION_ERROR, _error.str());                    \
+            } else {                                                           \
+                FatalError(CUDA_CALL_ERROR, _error.str());                     \
+            }                                                                  \
         }                                                                      \
     }
 #endif

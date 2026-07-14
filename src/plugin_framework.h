@@ -18,6 +18,7 @@
 #pragma once
 
 #include <nvimgcodec.h>
+#include <filesystem>
 #include <map>
 #include <string>
 #include <vector>
@@ -33,6 +34,10 @@ class ILogger;
 
 std::string GetDefaultExtensionsPath();
 char GetPathSeparator();
+// Build the default extensions search path from a libnvimgcodec dynamic-library
+// directory. Returns "<so_dir>/extensions".
+// Exposed for unit tests.
+std::string BuildDefaultExtensionsPathFromSoDir(const std::filesystem::path& so_dir);
 class PluginFramework
 {
   public:

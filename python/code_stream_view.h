@@ -19,6 +19,7 @@
 
 #include <nvimgcodec.h>
 #include <pybind11/pybind11.h>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <iostream>
@@ -37,15 +38,16 @@ class CodeStreamView
       : impl_{view}
     {
         impl_.struct_next = nullptr;
+        impl_.region.struct_next = nullptr;
     }
 
     CodeStreamView(size_t image_idx, const std::optional<Region>& region = std::nullopt,
-                   size_t bitstream_offset = 0, uint32_t limit_images = 0)
+                   const std::optional<size_t>& bitstream_offset = std::nullopt)
     {
         impl_.image_idx = image_idx;
         impl_.region = region.value_or(Region());
-        impl_.bitstream_offset = bitstream_offset;
-        impl_.limit_images = limit_images;
+        impl_.region.struct_next = nullptr;
+        impl_.bitstream_offset = bitstream_offset.value_or(0);
     }
 
     operator nvimgcodecCodeStreamView_t() const { return impl_; }
@@ -64,11 +66,7 @@ class CodeStreamView
         return impl_.bitstream_offset;
     }
 
-    uint32_t limitImages() const {
-        return impl_.limit_images;
-    }
-
-    nvimgcodecCodeStreamView_t impl_ = {NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_VIEW, sizeof(nvimgcodecCodeStreamView_t), nullptr, 0, {}, 0, 0};
+    nvimgcodecCodeStreamView_t impl_ = {NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_VIEW, sizeof(nvimgcodecCodeStreamView_t), nullptr, 0, {}, 0};
 };
 
 std::ostream& operator<<(std::ostream& os, const CodeStreamView& v);

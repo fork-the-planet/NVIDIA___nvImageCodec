@@ -489,6 +489,93 @@ TEST_F(JPEG2KParserPluginTest, Uint16_Precision_12_FromHostMem)
     expect_eq(expected_cat_1245673_640_12bit(), info);
 }
 
+TEST_F(JPEG2KParserPluginTest, XRSiz_YRSiz_is_0)
+{
+    auto buffer = read_file(resources_dir + "/jpeg2k/corrupted/XRSiz_YRSiz_is_0.jp2");
+    LoadImageFromHostMemory(instance_, stream_handle_, buffer.data(), buffer.size());
+    nvimgcodecImageInfo_t info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};
+    ASSERT_EQ(NVIMGCODEC_STATUS_BAD_CODESTREAM, nvimgcodecCodeStreamGetImageInfo(stream_handle_, &info));
+}
+
+// A JP2 file whose ihdr image-header dimensions disagree with the codestream SIZ marker must
+// be rejected. Otherwise the malformed file can flow through to the OpenCV/openjpeg fallback
+// decoder and crash the process (SIGSEGV in opj_jp2_read_header).
+TEST_F(JPEG2KParserPluginTest, IhdrHeightMismatchSiz)
+{
+    auto buffer = read_file(resources_dir + "/jpeg2k/cat-1046544_640.jp2");
+    // 'i','h','d','r' followed by height=475 (0x000001db) and width=640 (0x00000280) -
+    // the original ihdr box of cat-1046544_640.jp2 (RGB, 640x475).
+    std::vector<uint8_t> original_ihdr = {
+        0x69, 0x68, 0x64, 0x72,
+        0x00, 0x00, 0x01, 0xdb,
+        0x00, 0x00, 0x02, 0x80};
+    // Same box but with height patched to 4096 (0x00001000); the codestream SIZ marker
+    // further down in the file still reports 640x475 - this reproduces the malformed case.
+    std::vector<uint8_t> mutated_ihdr = {
+        0x69, 0x68, 0x64, 0x72,
+        0x00, 0x00, 0x10, 0x00,
+        0x00, 0x00, 0x02, 0x80};
+    buffer = replace(buffer, original_ihdr, mutated_ihdr);
+    LoadImageFromHostMemory(instance_, stream_handle_, buffer.data(), buffer.size());
+    nvimgcodecImageInfo_t info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};
+    ASSERT_EQ(NVIMGCODEC_STATUS_BAD_CODESTREAM, nvimgcodecCodeStreamGetImageInfo(stream_handle_, &info));
+}
+
+TEST_F(JPEG2KParserPluginTest, IhdrWidthMismatchSiz)
+{
+    auto buffer = read_file(resources_dir + "/jpeg2k/cat-1046544_640.jp2");
+    std::vector<uint8_t> original_ihdr = {
+        0x69, 0x68, 0x64, 0x72,
+        0x00, 0x00, 0x01, 0xdb,
+        0x00, 0x00, 0x02, 0x80};
+    // Width patched to 4096 (0x00001000); height is left at 475.
+    std::vector<uint8_t> mutated_ihdr = {
+        0x69, 0x68, 0x64, 0x72,
+        0x00, 0x00, 0x01, 0xdb,
+        0x00, 0x00, 0x10, 0x00};
+    buffer = replace(buffer, original_ihdr, mutated_ihdr);
+    LoadImageFromHostMemory(instance_, stream_handle_, buffer.data(), buffer.size());
+    nvimgcodecImageInfo_t info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};
+    ASSERT_EQ(NVIMGCODEC_STATUS_BAD_CODESTREAM, nvimgcodecCodeStreamGetImageInfo(stream_handle_, &info));
+}
+
+// A bare J2K codestream (no JP2 ihdr) whose SIZ marker reports XOSiz > XSiz must be rejected.
+// Without an explicit underflow guard, XSiz - XOSiz wraps in uint32_t and propagates into
+// DivUp() that sets plane geometry, producing nonsense dimensions for downstream allocators.
+TEST_F(JPEG2KParserPluginTest, CodeStreamOnly_InvalidSizOffsets)
+{
+    auto buffer = read_file(resources_dir + "/jpeg2k/cat-1046544_640.jp2");
+    // Strip the JP2 wrapper down to the SOC marker, matching Uint8_CodeStreamOnly.
+    std::vector<uint8_t> JP2_header_until_SOC = {
+        0x0, 0x0, 0x0, 0xc, 0x6a, 0x50, 0x20, 0x20, 0xd, 0xa, 0x87, 0xa,
+        0x0, 0x0, 0x0, 0x14, 0x66, 0x74, 0x79, 0x70, 0x6a, 0x70, 0x32,
+        0x20, 0x0, 0x0, 0x0, 0x0, 0x6a, 0x70, 0x32, 0x20, 0x0, 0x0, 0x0,
+        0x2d, 0x6a, 0x70, 0x32, 0x68, 0x0, 0x0, 0x0, 0x16, 0x69, 0x68,
+        0x64, 0x72, 0x0, 0x0, 0x1, 0xdb, 0x0, 0x0, 0x2, 0x80, 0x0, 0x3,
+        0x7, 0x7, 0x0, 0x0, 0x0, 0x0, 0x0, 0xf, 0x63, 0x6f, 0x6c, 0x72,
+        0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x10, 0x0, 0x8, 0x83, 0xe8, 0x6a,
+        0x70, 0x32, 0x63, 0xff, 0x4f};
+    std::vector<uint8_t> just_SOC = {0xff, 0x4f};
+    buffer = replace(buffer, JP2_header_until_SOC, just_SOC);
+    // Now patch the SIZ marker tail XSiz/YSiz/XOSiz/YOSiz so XOSiz > XSiz.
+    // Original SIZ layout for cat-1046544_640: XSiz=640 (0x00000280), YSiz=475 (0x000001db),
+    // XOSiz=0, YOSiz=0. Replace XOSiz with 0x000003e8 (1000) which exceeds XSiz.
+    std::vector<uint8_t> original_siz_tail = {
+        0x00, 0x00, 0x02, 0x80,
+        0x00, 0x00, 0x01, 0xdb,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00};
+    std::vector<uint8_t> mutated_siz_tail = {
+        0x00, 0x00, 0x02, 0x80,
+        0x00, 0x00, 0x01, 0xdb,
+        0x00, 0x00, 0x03, 0xe8,
+        0x00, 0x00, 0x00, 0x00};
+    buffer = replace(buffer, original_siz_tail, mutated_siz_tail);
+    LoadImageFromHostMemory(instance_, stream_handle_, buffer.data(), buffer.size());
+    nvimgcodecImageInfo_t info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};
+    ASSERT_EQ(NVIMGCODEC_STATUS_BAD_CODESTREAM, nvimgcodecCodeStreamGetImageInfo(stream_handle_, &info));
+}
+
 TEST_F(JPEG2KParserPluginTest, Uint8_CodeStreamOnly) {
     auto buffer = read_file(resources_dir + "/jpeg2k/cat-1046544_640.jp2");
     std::vector<uint8_t> JP2_header_until_SOC = {

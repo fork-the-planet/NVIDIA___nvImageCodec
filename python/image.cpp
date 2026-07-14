@@ -31,18 +31,24 @@
 #include <imgproc/stream_device.h>
 #include <imgproc/device_guard.h>
 #include <imgproc/device_buffer.h>
+#include <imgproc/pageable_host_buffer.h>
 #include <imgproc/pinned_buffer.h>
 #include "imgproc/type_utils.h"
+#include "device_utils.h"
 #include "dlpack_utils.h"
 #include "error_handling.h"
 #include "type_utils.h"
 #include "sample_format.h"
+// Included after error_handling.h so CopyImage uses this TU's CHECK_CUDA
+// (error_handling.h's std::runtime_error variant) instead of redefining it.
+#include "imgproc/copy_image.h"
 
 namespace nvimgcodec {
 
-Image::Image(nvimgcodecInstance_t instance, ILogger* logger, nvimgcodecImageInfo_t* image_info)
+Image::Image(nvimgcodecInstance_t instance, ILogger* logger, nvimgcodecImageInfo_t* image_info, int device_id)
     : instance_(instance)
     , logger_(logger)
+    , device_id_(resolve_device_id(device_id))
 {
     py::gil_scoped_release release;
     initBuffer(image_info);
@@ -71,6 +77,7 @@ void Image::initBuffer(nvimgcodecImageInfo_t* image_info)
 
 void Image::initDeviceBuffer(nvimgcodecImageInfo_t* image_info)
 {
+    DeviceGuard device_guard(device_id_);
     // Create shared_ptr<DeviceBuffer> and store in variant
     auto device_buffer = std::make_shared<DeviceBuffer>();
     device_buffer->resize(GetBufferSize(*image_info), image_info->cuda_stream);
@@ -84,25 +91,34 @@ void Image::initDeviceBuffer(nvimgcodecImageInfo_t* image_info)
 
 void Image::initHostBuffer(nvimgcodecImageInfo_t* image_info)
 {
-    // Create shared_ptr<PinnedBuffer> and store in variant
-    auto pinned_buffer = std::make_shared<PinnedBuffer>();
-    pinned_buffer->resize(GetBufferSize(*image_info), image_info->cuda_stream);
-    
-    // Store in the variant
-    img_buffer_ = pinned_buffer;
-    
-    // Set the buffer pointer for the image info
-    image_info->buffer = static_cast<unsigned char*>(pinned_buffer->data);
+    const size_t buffer_size = GetBufferSize(*image_info);
+    void* data = nullptr;
+    // CPU-only callers may not have libcuda available, so cudaMallocHost
+    // (which calls cudaGetDeviceCount internally) cannot be used. Fall back
+    // to a plain pageable host buffer in that case.
+    if (device_id_ == NVIMGCODEC_DEVICE_CPU_ONLY) {
+        auto buffer = std::make_shared<PageableHostBuffer>();
+        buffer->resize(buffer_size);
+        data = buffer->data;
+        img_buffer_ = std::move(buffer);
+    } else {
+        auto buffer = std::make_shared<PinnedBuffer>();
+        buffer->resize(buffer_size, image_info->cuda_stream);
+        data = buffer->data;
+        img_buffer_ = std::move(buffer);
+    }
+    image_info->buffer = static_cast<unsigned char*>(data);
 }
 
-void Image::initImageInfoFromDLPack(nvimgcodecImageInfo_t* image_info, py::capsule cap)
+void Image::initImageInfoFromDLPack(nvimgcodecImageInfo_t* image_info, py::capsule cap,
+    std::optional<nvimgcodecSampleFormat_t> sample_format, std::optional<nvimgcodecColorSpec_t> color_spec)
 {
     if (auto* tensor = static_cast<DLManagedTensor*>(cap.get_pointer())) {
         check_cuda_buffer(tensor->dl_tensor.data);
         dlpack_tensor_ = std::make_shared<DLPackTensor>(logger_, tensor);
         // signal that producer don't have to call tensor's deleter, consumer will do it instead
         cap.set_name("used_dltensor");
-        dlpack_tensor_->getImageInfo(image_info);
+        dlpack_tensor_->getImageInfo(image_info, sample_format, color_spec);
     } else {
         throw std::runtime_error("Unsupported dlpack PyCapsule object.");
     }
@@ -110,51 +126,54 @@ void Image::initImageInfoFromDLPack(nvimgcodecImageInfo_t* image_info, py::capsu
 
 namespace {
 
-// Helper function to get the minimum number of channels required for a sample format
-int getMinChannelsForSampleFormat(nvimgcodecSampleFormat_t sample_format) {
-    switch (sample_format) {
-        case NVIMGCODEC_SAMPLEFORMAT_P_Y:
-        case NVIMGCODEC_SAMPLEFORMAT_I_Y:
-            return 1;
-        case NVIMGCODEC_SAMPLEFORMAT_P_YA:
-        case NVIMGCODEC_SAMPLEFORMAT_I_YA:
-            return 2;
-        case NVIMGCODEC_SAMPLEFORMAT_P_RGB:
-        case NVIMGCODEC_SAMPLEFORMAT_I_RGB:
-        case NVIMGCODEC_SAMPLEFORMAT_P_BGR:
-        case NVIMGCODEC_SAMPLEFORMAT_I_BGR:
-        case NVIMGCODEC_SAMPLEFORMAT_P_YUV:
-        case NVIMGCODEC_SAMPLEFORMAT_I_YUV:
-            return 3;
-        case NVIMGCODEC_SAMPLEFORMAT_P_RGBA:
-        case NVIMGCODEC_SAMPLEFORMAT_I_RGBA:
-        case NVIMGCODEC_SAMPLEFORMAT_P_CMYK:
-        case NVIMGCODEC_SAMPLEFORMAT_I_CMYK:
-        case NVIMGCODEC_SAMPLEFORMAT_P_YCCK:
-        case NVIMGCODEC_SAMPLEFORMAT_I_YCCK:
-            return 4;
-        case NVIMGCODEC_SAMPLEFORMAT_P_UNCHANGED:
-        case NVIMGCODEC_SAMPLEFORMAT_I_UNCHANGED:
-        case NVIMGCODEC_SAMPLEFORMAT_UNKNOWN:
-        default:
-            return -1; // -1 means any number is acceptable
+// Validate that user-provided precision is compatible with the sample type bitdepth.
+// precision == 0 (the default) means "use full bitdepth" and is always valid.
+// For floating-point sample types, only the dtype's full bitdepth (or 0) is accepted,
+// because a sub-bitdepth "significant bits" count is an integer-image concept and has
+// no meaningful interpretation for float storage.
+void validatePrecisionForSampleType(int precision, nvimgcodecSampleDataType_t sample_type) {
+    if (precision == 0) {
+        return;
+    }
+    if (precision < 0) {
+        throw std::invalid_argument("Invalid precision " + std::to_string(precision) +
+                                    ". Precision must be a non-negative integer.");
+    }
+    int bitdepth = static_cast<int>(sample_type_to_bytes_per_element(sample_type)) * 8;
+    if (precision > bitdepth) {
+        throw std::invalid_argument("Precision " + std::to_string(precision) +
+                                    " exceeds the bitdepth of the sample type (" +
+                                    std::to_string(bitdepth) + " bits).");
+    }
+    bool is_float = sample_type == NVIMGCODEC_SAMPLE_DATA_TYPE_FLOAT16 ||
+                    sample_type == NVIMGCODEC_SAMPLE_DATA_TYPE_FLOAT32 ||
+                    sample_type == NVIMGCODEC_SAMPLE_DATA_TYPE_FLOAT64;
+    if (is_float && precision != bitdepth) {
+        throw std::invalid_argument("Invalid precision " + std::to_string(precision) +
+                                    " for floating-point sample type. Only the dtype's full bitdepth (" +
+                                    std::to_string(bitdepth) +
+                                    ") or 0 (meaning full bitdepth) is supported for float dtypes.");
     }
 }
 
-// Validate that the sample format is compatible with the number of channels
-void validateSampleFormatChannels(nvimgcodecSampleFormat_t sample_format, int num_channels) {
-    int min_required_channels = getMinChannelsForSampleFormat(sample_format);
-    
-    // If min_required_channels is -1, any number of channels is acceptable
-    if (min_required_channels == -1) {
+// The allocation on the target_device relies on cudaMallocAsync, which takes
+// the memory pool from the stream's device rather than the current context.
+// A stream from a different device would silently allocate on the wrong
+// device and leave the resulting Image.device_id inconsistent with the actual
+// buffer location. The default (null) stream, cudaStreamLegacy, and
+// cudaStreamPerThread are per-current-device sentinels that are resolved
+// correctly by the surrounding DeviceGuard, so skip them.
+void validate_stream_device(cudaStream_t stream, int target_device_id)
+{
+    if (stream == nullptr || stream == cudaStreamLegacy || stream == cudaStreamPerThread) {
         return;
     }
-    
-    // Check if we have at least the minimum required channels
-    if (num_channels < min_required_channels) {
-        throw std::invalid_argument("Invalid sample_format for the number of channels. Sample format requires at least " + 
-                                   std::to_string(min_required_channels) + " channel(s), but image has only " + 
-                                   std::to_string(num_channels) + " channel(s).");
+    int stream_dev = nvimgcodec::get_stream_device_id(stream);
+    if (stream_dev != target_device_id) {
+        throw std::invalid_argument(
+            "cuda_stream belongs to device " + std::to_string(stream_dev) +
+            " but device_id is " + std::to_string(target_device_id) +
+            ". cuda_stream must be created on the same device as device_id.");
     }
 }
 
@@ -163,9 +182,6 @@ void validateSampleFormatChannels(nvimgcodecSampleFormat_t sample_format, int nu
 void Image::initImageInfoFromInterfaceDict(const py::dict& iface, nvimgcodecImageInfo_t* image_info,
     std::optional<nvimgcodecSampleFormat_t> sample_format, std::optional<nvimgcodecColorSpec_t> color_spec)
 {
-
-    bool is_interleaved = true; //TODO detect interleaved if we have HWC layout
-
     std::vector<long> vshape;
     py::tuple shape = iface["shape"].cast<py::tuple>();
     for (auto& o : shape) {
@@ -177,6 +193,13 @@ void Image::initImageInfoFromInterfaceDict(const py::dict& iface, nvimgcodecImag
     if (vshape.size() > 3) {
         throw std::runtime_error("Unexpected number of dimensions. At most 3 dimensions are expected.");
     }
+
+    // Layout (HWC vs CHW) and the sample_format / color_spec labels follow the
+    // caller's sample_format, resolved by the shared helpers in type_utils.h so
+    // this path and the DLPack path stay in lockstep.
+    AsImageLayout layout = resolveAsImageLayout(vshape, sample_format);
+    const bool is_interleaved = layout.is_interleaved;
+
     if (!is_padding_correct(iface, is_interleaved)) {
         throw std::runtime_error("Unexpected array style. Padding is only allowed for rows. Other dimensions should have contiguous strides.");
     }
@@ -191,61 +214,29 @@ void Image::initImageInfoFromInterfaceDict(const py::dict& iface, nvimgcodecImag
         }
     }
 
-    if (is_interleaved) {
-        image_info->num_planes = 1;
-        image_info->plane_info[0].height = vshape[0];
-        image_info->plane_info[0].width = vshape[1];
-        image_info->plane_info[0].num_channels = vshape.size() == 3 ? vshape[2] : 1;
-    } else {
-        image_info->num_planes = vshape[0];
-        image_info->plane_info[0].height = vshape[1];
-        image_info->plane_info[0].width = vshape[2];
-        image_info->plane_info[0].num_channels = 1;
-    }
+    image_info->num_planes = layout.num_planes;
+    image_info->plane_info[0].height = layout.height;
+    image_info->plane_info[0].width = layout.width;
+    image_info->plane_info[0].num_channels = layout.num_channels;
 
     std::string typestr = iface["typestr"].cast<std::string>();
     auto sample_type = type_from_format_str(typestr);
 
     int bytes_per_element = sample_type_to_bytes_per_element(sample_type);
 
-    image_info->chroma_subsampling = NVIMGCODEC_SAMPLING_444;
+    const int num_channels =
+        is_interleaved ? static_cast<int>(layout.num_channels) : static_cast<int>(layout.num_planes);
+    AsImageLabels labels = resolveAsImageLabels(num_channels, sample_format, color_spec);
+    image_info->sample_format = labels.sample_format;
+    image_info->color_spec = labels.color_spec;
+    image_info->chroma_subsampling = labels.chroma_subsampling;
 
-    // Validate user-provided sample_format against number of channels
-    int num_channels = image_info->plane_info[0].num_channels;
-    if (sample_format.has_value()) {
-        validateSampleFormatChannels(sample_format.value(), num_channels);
-    }
-
-    // Set sample_format based on number of channels (if not provided by user)
-    if (num_channels == 0) {
-        // 0 channels  not allowed
-        throw std::runtime_error("Unexpected number of channels. At least 1 channel is expected.");
-    } else if (num_channels == 1) {
-        // Single channel (grayscale) - default to interleaved
-        image_info->color_spec = color_spec.value_or(NVIMGCODEC_COLORSPEC_GRAY);
-        image_info->chroma_subsampling = NVIMGCODEC_SAMPLING_GRAY;
-        image_info->sample_format = sample_format.value_or(NVIMGCODEC_SAMPLEFORMAT_I_Y);
-    } else if (num_channels == 2) {
-        // 2 channels (grayscale with alpha) - default to interleaved
-        image_info->color_spec = color_spec.value_or(NVIMGCODEC_COLORSPEC_GRAY);
-        image_info->chroma_subsampling = NVIMGCODEC_SAMPLING_GRAY;
-        image_info->sample_format = sample_format.value_or(NVIMGCODEC_SAMPLEFORMAT_I_YA);
-    } else if (num_channels == 3) {
-        // 3 channels (typically RGB)
-        image_info->color_spec = color_spec.value_or(NVIMGCODEC_COLORSPEC_SRGB);
-        image_info->sample_format = sample_format.value_or(is_interleaved ? NVIMGCODEC_SAMPLEFORMAT_I_RGB : NVIMGCODEC_SAMPLEFORMAT_P_RGB);
-    } else if (num_channels == 4) {
-        // 4 channels (typically RGBA)
-        image_info->color_spec = color_spec.value_or(NVIMGCODEC_COLORSPEC_SRGB);
-        image_info->sample_format = sample_format.value_or(NVIMGCODEC_SAMPLEFORMAT_I_RGBA);
-    } else {
-        // More than 4 channels
-        image_info->color_spec = color_spec.value_or(NVIMGCODEC_COLORSPEC_UNKNOWN);
-        image_info->sample_format = sample_format.value_or(NVIMGCODEC_SAMPLEFORMAT_UNKNOWN);
-    }
-
-    int pitch_in_bytes = vstrides.size() > 1 ? (is_interleaved ? vstrides[0] : vstrides[1])
-                                             : image_info->plane_info[0].width * image_info->plane_info[0].num_channels * bytes_per_element;
+    // Row stride axis: HWC -> stride[0]; 3-D CHW planar -> stride[1] (rows
+    // live inside each plane); 2-D HW planar (P_Y) -> stride[0].
+    const int row_stride_axis = (vshape.size() == 3 && !is_interleaved) ? 1 : 0;
+    size_t pitch_in_bytes = vstrides.size() > 1
+        ? vstrides[row_stride_axis]
+        : static_cast<size_t>(image_info->plane_info[0].width) * image_info->plane_info[0].num_channels * bytes_per_element;
     for (size_t c = 0; c < image_info->num_planes; c++) {
         image_info->plane_info[c].width = image_info->plane_info[0].width;
         image_info->plane_info[c].height = image_info->plane_info[0].height;
@@ -260,9 +251,11 @@ void Image::initImageInfoFromInterfaceDict(const py::dict& iface, nvimgcodecImag
 
 Image::Image(nvimgcodecInstance_t instance, ILogger* logger, PyObject* o, intptr_t cuda_stream,
              std::optional<nvimgcodecSampleFormat_t> sample_format,
-             std::optional<nvimgcodecColorSpec_t> color_spec)
+             std::optional<nvimgcodecColorSpec_t> color_spec,
+             std::optional<int> precision)
     : instance_(instance)
     , logger_(logger)
+    , device_id_(NVIMGCODEC_DEVICE_CURRENT)
     , img_buffer_{nvimgcodecImageInfo_t{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0}}
 {
     if (!o) {
@@ -273,7 +266,7 @@ Image::Image(nvimgcodecInstance_t instance, ILogger* logger, PyObject* o, intptr
     image_info.cuda_stream = reinterpret_cast<cudaStream_t>(cuda_stream);
     if (py::isinstance<py::capsule>(tmp)) {
         py::capsule cap = tmp.cast<py::capsule>();
-        initImageInfoFromDLPack(&image_info, cap);
+        initImageInfoFromDLPack(&image_info, cap, sample_format, color_spec);
     } else if (hasattr(tmp, "__cuda_array_interface__")) {
         py::dict iface = tmp.attr("__cuda_array_interface__").cast<py::dict>();
 
@@ -312,6 +305,7 @@ Image::Image(nvimgcodecInstance_t instance, ILogger* logger, PyObject* o, intptr
             throw std::runtime_error("Unsupported __array_interface__ with version < 2");
         }
 
+        device_id_ = NVIMGCODEC_DEVICE_CPU_ONLY;
         initImageInfoFromInterfaceDict(iface, &image_info, sample_format, color_spec);
         image_info.buffer_kind = NVIMGCODEC_IMAGE_BUFFER_KIND_STRIDED_HOST;
         
@@ -327,9 +321,25 @@ Image::Image(nvimgcodecInstance_t instance, ILogger* logger, PyObject* o, intptr
         }
         py::object py_cuda_stream = cuda_stream ? py::int_((intptr_t)(cuda_stream)) : py::int_(1);
         py::capsule cap = tmp.attr("__dlpack__")("stream"_a = py_cuda_stream).cast<py::capsule>();
-        initImageInfoFromDLPack(&image_info, cap);
+        initImageInfoFromDLPack(&image_info, cap, sample_format, color_spec);
     } else {
         throw std::runtime_error("Object does not support neither __cuda_array_interface__ nor __dlpack__");
+    }
+
+    if (device_id_ == NVIMGCODEC_DEVICE_CURRENT && image_info.buffer_kind == NVIMGCODEC_IMAGE_BUFFER_KIND_STRIDED_DEVICE) {
+        cudaPointerAttributes ptr_attrs{};
+        CHECK_CUDA(cudaPointerGetAttributes(&ptr_attrs, image_info.buffer));
+        device_id_ = ptr_attrs.device;
+    }
+
+    for (uint32_t c = 1; c < image_info.num_planes; ++c) {
+        assert(image_info.plane_info[c].sample_type == image_info.plane_info[0].sample_type);
+    }
+    if (precision.has_value()) {
+        validatePrecisionForSampleType(precision.value(), image_info.plane_info[0].sample_type);
+        for (uint32_t c = 0; c < image_info.num_planes; ++c) {
+            image_info.plane_info[c].precision = static_cast<uint8_t>(precision.value());
+        }
     }
 
     py::gil_scoped_release release;
@@ -397,6 +407,18 @@ int Image::getNdim() const
 {
     //Shape has always 3 dimensions either WHC (interleaved) or CHW (planar)
     return 3;
+}
+
+int Image::num_channels() const
+{
+    py::gil_scoped_release release;
+    nvimgcodecImageInfo_t image_info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};
+    nvimgcodecImageGetImageInfo(image_.get(), &image_info);
+    int total_channels = 0;
+    for (uint32_t i = 0; i < image_info.num_planes; ++i) {
+        total_channels += image_info.plane_info[i].num_channels;
+    }
+    return total_channels;
 }
 
 py::dict Image::array_interface() const
@@ -523,7 +545,7 @@ int Image::precision() const
         py::gil_scoped_release release;
         nvimgcodecImageGetImageInfo(image_.get(), &image_info);
     }
-    return image_info.plane_info[0].precision;
+    return resolve_precision(image_info.plane_info[0].precision, image_info.plane_info[0].sample_type);
 }
 
 nvimgcodecSampleFormat_t Image::getSampleFormat() const
@@ -544,6 +566,32 @@ nvimgcodecColorSpec_t Image::getColorSpec() const
         nvimgcodecImageGetImageInfo(image_.get(), &image_info);
     }
     return image_info.color_spec;
+}
+
+std::optional<int> Image::getDeviceId() const
+{
+    nvimgcodecImageInfo_t image_info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};
+    {
+        py::gil_scoped_release release;
+        nvimgcodecImageGetImageInfo(image_.get(), &image_info);
+    }
+    if (image_info.buffer_kind == NVIMGCODEC_IMAGE_BUFFER_KIND_STRIDED_HOST) {
+        return std::nullopt;
+    }
+    return device_id_;
+}
+
+std::optional<intptr_t> Image::getCudaStream() const
+{
+    nvimgcodecImageInfo_t image_info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};
+    {
+        py::gil_scoped_release release;
+        nvimgcodecImageGetImageInfo(image_.get(), &image_info);
+    }
+    if (image_info.buffer_kind == NVIMGCODEC_IMAGE_BUFFER_KIND_STRIDED_HOST) {
+        return std::nullopt;
+    }
+    return reinterpret_cast<intptr_t>(image_info.cuda_stream);
 }
 
 nvimgcodecImageBufferKind_t Image::getBufferKind() const
@@ -570,6 +618,12 @@ size_t Image::size() const
             return pinned_buffer->size;
         }
         return 0;
+    } else if (std::holds_alternative<std::shared_ptr<PageableHostBuffer>>(img_buffer_)) {
+        auto host_buffer = std::get<std::shared_ptr<PageableHostBuffer>>(img_buffer_);
+        if (host_buffer) {
+            return host_buffer->size;
+        }
+        return 0;
     } else {
         assert(std::holds_alternative<nvimgcodecImageInfo_t>(img_buffer_));
         // For externally managed buffers, get size from image info
@@ -594,6 +648,12 @@ size_t Image::capacity() const
         auto pinned_buffer = std::get<std::shared_ptr<PinnedBuffer>>(img_buffer_);
         if (pinned_buffer) {
             return pinned_buffer->capacity;
+        }
+        return 0;
+    } else if (std::holds_alternative<std::shared_ptr<PageableHostBuffer>>(img_buffer_)) {
+        auto host_buffer = std::get<std::shared_ptr<PageableHostBuffer>>(img_buffer_);
+        if (host_buffer) {
+            return host_buffer->capacity;
         }
         return 0;
     } else {
@@ -656,25 +716,11 @@ py::object Image::cpu()
         }
         assert(GetBufferSize(cpu_image_info) == GetImageSize(cpu_image_info));
 
-        auto image = new Image(instance_, logger_, &cpu_image_info);
+        auto image = new Image(instance_, logger_, &cpu_image_info, NVIMGCODEC_DEVICE_CPU_ONLY);
         {
             py::gil_scoped_release release;
-            if (cpu_image_info.plane_info[0].row_stride == image_info.plane_info[0].row_stride) {
-                // new cpu_image_info is continuous, so original image also must be continuous
-                // we can just memcpy whole image
-                assert(GetBufferSize(cpu_image_info) == GetBufferSize(image_info));
-                CHECK_CUDA(cudaMemcpyAsync(
-                    cpu_image_info.buffer, image_info.buffer, GetBufferSize(image_info),
-                    cudaMemcpyDeviceToHost, image_info.cuda_stream
-                ));
-            } else {
-                CHECK_CUDA(cudaMemcpy2DAsync(
-                    cpu_image_info.buffer, cpu_image_info.plane_info[0].row_stride,
-                    image_info.buffer, image_info.plane_info[0].row_stride,
-                    cpu_image_info.plane_info[0].row_stride, cpu_image_info.plane_info[0].height,
-                    cudaMemcpyHostToDevice, image_info.cuda_stream
-                ));
-            }
+            DeviceGuard device_guard(device_id_);
+            CopyImage(cpu_image_info, image_info, cudaMemcpyDeviceToHost, image_info.cuda_stream);
             CHECK_CUDA(cudaStreamSynchronize(image_info.cuda_stream));
         }
         return py::cast(image,  py::return_value_policy::take_ownership);
@@ -685,17 +731,20 @@ py::object Image::cpu()
     }
 }
 
-py::object Image::cuda(bool synchronize)
+py::object Image::cuda(bool synchronize, int device_id, intptr_t cuda_stream)
 {
     nvimgcodecImageInfo_t image_info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};
     {
         py::gil_scoped_release release;
         nvimgcodecImageGetImageInfo(image_.get(), &image_info);
     }
+    auto target_stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
     if (image_info.buffer_kind == NVIMGCODEC_IMAGE_BUFFER_KIND_STRIDED_HOST) {
         nvimgcodecImageInfo_t cuda_image_info(image_info);
         cuda_image_info.buffer_kind = NVIMGCODEC_IMAGE_BUFFER_KIND_STRIDED_DEVICE;
         cuda_image_info.buffer = nullptr;
+        cuda_image_info.cuda_stream = target_stream;
         for (unsigned int c = 0; c < cuda_image_info.num_planes; ++c) {
             auto& plane_info = cuda_image_info.plane_info[c];
             size_t bpp = TypeSize(plane_info.sample_type);
@@ -703,35 +752,62 @@ py::object Image::cuda(bool synchronize)
         }
         assert(GetBufferSize(cuda_image_info) == GetImageSize(cuda_image_info));
 
-        auto image = new Image(instance_, logger_, &cuda_image_info);
+        auto target_device_id = resolve_device_id(device_id);
+        validate_stream_device(target_stream, target_device_id);
+        auto image = new Image(instance_, logger_, &cuda_image_info, target_device_id);
         {
             py::gil_scoped_release release;
-            if (cuda_image_info.plane_info[0].row_stride == image_info.plane_info[0].row_stride) {
-                // new cuda_image_info is continuous, so original image also must be continuous
-                // we can just memcpy whole image
-                assert(GetBufferSize(cuda_image_info) == GetBufferSize(image_info));
-                CHECK_CUDA(cudaMemcpyAsync(
-                    cuda_image_info.buffer, image_info.buffer, GetBufferSize(cuda_image_info),
-                    cudaMemcpyHostToDevice, cuda_image_info.cuda_stream
-                ));
-            } else {
-                CHECK_CUDA(cudaMemcpy2DAsync(
-                    cuda_image_info.buffer, cuda_image_info.plane_info[0].row_stride,
-                    image_info.buffer, image_info.plane_info[0].row_stride,
-                    cuda_image_info.plane_info[0].row_stride, cuda_image_info.plane_info[0].height,
-                    cudaMemcpyHostToDevice, cuda_image_info.cuda_stream
-                ));
-            }
+            DeviceGuard device_guard(target_device_id);
+            CopyImage(cuda_image_info, image_info, cudaMemcpyHostToDevice, target_stream);
             if (synchronize) {
-                CHECK_CUDA(cudaStreamSynchronize(cuda_image_info.cuda_stream));
+                CHECK_CUDA(cudaStreamSynchronize(target_stream));
             }
         }
+        // The async memcpy is enqueued on target_stream. Break the library's
+        // dependency on target_stream so the caller may destroy it at any
+        // time after this call returns.
+        image->detachFromUserStream();
         return py::cast(image,  py::return_value_policy::take_ownership);
     } else if (image_info.buffer_kind == NVIMGCODEC_IMAGE_BUFFER_KIND_STRIDED_DEVICE) {
-        return py::cast(this);
+        int target_device_id = resolve_device_id(device_id);
+        if (target_device_id == device_id_) {
+            return py::cast(this);
+        }
+        validate_stream_device(target_stream, target_device_id);
+        // Cross-device copy: create new image on target device with the same layout
+        nvimgcodecImageInfo_t cuda_image_info(image_info);
+        cuda_image_info.buffer = nullptr;
+        cuda_image_info.cuda_stream = target_stream;
+        auto image = new Image(instance_, logger_, &cuda_image_info, target_device_id);
+        {
+            py::gil_scoped_release release;
+            CHECK_CUDA(cudaMemcpyPeerAsync(
+                cuda_image_info.buffer, target_device_id,
+                image_info.buffer, device_id_,
+                GetBufferSize(cuda_image_info),
+                target_stream));
+            if (synchronize) {
+                CHECK_CUDA(cudaStreamSynchronize(target_stream));
+            }
+        }
+        // The async peer copy is enqueued on target_stream. Break the
+        // library's dependency on target_stream so the caller may destroy it
+        // at any time after this call returns.
+        image->detachFromUserStream();
+        return py::cast(image, py::return_value_policy::take_ownership);
     } else {
         return py::none();
     }
+}
+
+void Image::detachFromUserStream() noexcept
+{
+    if (auto* db = std::get_if<std::shared_ptr<DeviceBuffer>>(&img_buffer_)) {
+        if (*db) (*db)->detach_from_stream();
+    } else if (auto* pb = std::get_if<std::shared_ptr<PinnedBuffer>>(&img_buffer_)) {
+        if (*pb) (*pb)->detach_from_stream();
+    }
+    // PageableHostBuffer does not reference any stream, so nothing to do.
 }
 
 void Image::reuse(nvimgcodecImageInfo_t* image_info)
@@ -748,49 +824,91 @@ void Image::reuse(nvimgcodecImageInfo_t* image_info)
         pinned_buffer->resize(GetBufferSize(*image_info), image_info->cuda_stream);
         image_info->buffer = static_cast<unsigned char*>(pinned_buffer->data);
         image_info->buffer_kind = NVIMGCODEC_IMAGE_BUFFER_KIND_STRIDED_HOST;
+    } else if (std::holds_alternative<std::shared_ptr<PageableHostBuffer>>(img_buffer_)) {
+        auto host_buffer = std::get<std::shared_ptr<PageableHostBuffer>>(img_buffer_);
+        host_buffer->resize(GetBufferSize(*image_info));
+        image_info->buffer = static_cast<unsigned char*>(host_buffer->data);
+        image_info->buffer_kind = NVIMGCODEC_IMAGE_BUFFER_KIND_STRIDED_HOST;
     } else { // externally manager buffer
         assert(std::holds_alternative<nvimgcodecImageInfo_t>(img_buffer_));
         auto buffer_info = std::get<nvimgcodecImageInfo_t>(img_buffer_);
-        if (buffer_info.num_planes != 1) {
-            throw std::invalid_argument("Only single plane (interleaved format) reuse for external buffer is supported");
-        }
 
-        if (buffer_info.num_planes < image_info->num_planes) {
-            throw std::invalid_argument("Number of planes in the buffer is not enough");
-        }
-
-        const auto& new_image_plane = image_info->plane_info[0];
-        size_t new_image_row_size = (static_cast<size_t>(new_image_plane.width) *
-            new_image_plane.num_channels *
-            sample_type_to_bytes_per_element(new_image_plane.sample_type)
-        );
-        assert(new_image_row_size == new_image_plane.row_stride); // assuming that no row padding is needed for new image
-
-        const auto& buffer_plane = buffer_info.plane_info[0];
-        size_t buffer_row_size = (static_cast<size_t>(buffer_plane.width) *
-            buffer_plane.num_channels *
-            sample_type_to_bytes_per_element(buffer_plane.sample_type)
-        );
-
-        if (image_info->plane_info[0].height > buffer_info.plane_info[0].height ||
-            new_image_row_size > buffer_row_size
-        ) {
-             // check if buffer is not continuous
-            if (buffer_row_size != buffer_plane.row_stride) {
-                throw std::invalid_argument("Existing buffer is not continuous. Row size or height are too small to fit new image.");
+        // True when every plane of `info` has its natural (packed) row stride
+        // and the plane stride is implicit `height * row_stride` - i.e. the
+        // buffer is one tightly-packed contiguous chunk. is_padding_correct
+        // already rejects plane gaps for externally-managed buffers, so we
+        // only need to check the row strides here.
+        auto is_packed_contiguous = [](const nvimgcodecImageInfo_t& info) {
+            for (uint32_t c = 0; c < info.num_planes; ++c) {
+                const auto& p = info.plane_info[c];
+                const size_t natural =
+                    static_cast<size_t>(p.width) * p.num_channels *
+                    sample_type_to_bytes_per_element(p.sample_type);
+                if (p.row_stride != natural) {
+                    return false;
+                }
             }
+            return true;
+        };
 
-            // buffer is continuous, but lets check if its size is enough
+        if (buffer_info.num_planes != image_info->num_planes) {
+            // Cross-layout reuse (e.g. an HWC buffer reused as a CHW decode
+            // target or vice versa). The bytes are reinterpreted under the
+            // decoder's resolved layout, so this is only well-defined when
+            // both sides are flat tightly-packed regions: any row or plane
+            // padding would create gaps the new layout cannot represent.
+            if (!is_packed_contiguous(buffer_info)) {
+                throw std::invalid_argument(
+                    "External buffer plane count (" + std::to_string(buffer_info.num_planes) +
+                    ") does not match the decoder's plane count (" +
+                    std::to_string(image_info->num_planes) +
+                    "). Cross-layout reuse requires the buffer to be row- and "
+                    "plane-contiguous (no padding); either remove the padding or "
+                    "wrap the buffer with a sample_format that produces the same "
+                    "layout as the decoded output.");
+            }
             if (GetBufferSize(*image_info) > GetBufferSize(buffer_info)) {
-                throw std::invalid_argument("Existing buffer is too small to fit new image");
+                throw std::invalid_argument(
+                    "Existing buffer is too small to fit new image after layout reinterpretation.");
             }
-
-            // new image fits inside the buffer, but it is outside of bounds (height or row size)
-            // so we wil keep row_stride of the new image
+            // image_info's plane row strides are already the packed naturals
+            // (decoder.cpp sets them that way before calling reuse), so no
+            // adoption from the buffer is meaningful here.
         } else {
-            // image fits in existing buffer bounds
-            // so lets just keep original row stride, as buffer may not be continuous.
-            image_info->plane_info[0].row_stride = buffer_info.plane_info[0].row_stride;
+            // Same plane count: the existing row-padded reuse logic.
+            const auto& new_image_plane = image_info->plane_info[0];
+            size_t new_image_row_size = (static_cast<size_t>(new_image_plane.width) *
+                new_image_plane.num_channels *
+                sample_type_to_bytes_per_element(new_image_plane.sample_type)
+            );
+            assert(new_image_row_size == new_image_plane.row_stride); // no row padding on the new image
+
+            const auto& buffer_plane = buffer_info.plane_info[0];
+            size_t buffer_row_size = (static_cast<size_t>(buffer_plane.width) *
+                buffer_plane.num_channels *
+                sample_type_to_bytes_per_element(buffer_plane.sample_type)
+            );
+
+            if (image_info->plane_info[0].height > buffer_info.plane_info[0].height ||
+                new_image_row_size > buffer_row_size
+            ) {
+                // Image is taller / wider than the buffer's per-plane bounds -
+                // the buffer must be contiguous and large enough in total.
+                if (buffer_row_size != buffer_plane.row_stride) {
+                    throw std::invalid_argument(
+                        "Existing buffer is not continuous. Row size or height are too small to fit new image.");
+                }
+                if (GetBufferSize(*image_info) > GetBufferSize(buffer_info)) {
+                    throw std::invalid_argument("Existing buffer is too small to fit new image");
+                }
+                // Keep the new image's natural row_stride.
+            } else {
+                // Image fits in the existing buffer; adopt the buffer's row
+                // stride (which may carry right-side padding) plane-by-plane.
+                for (uint32_t c = 0; c < image_info->num_planes; ++c) {
+                    image_info->plane_info[c].row_stride = buffer_info.plane_info[c].row_stride;
+                }
+            }
         }
 
         if (buffer_info.cuda_stream != image_info->cuda_stream) {
@@ -802,7 +920,18 @@ void Image::reuse(nvimgcodecImageInfo_t* image_info)
         image_info->buffer_kind = buffer_info.buffer_kind;
     }
 
+    // Decoded Image reuse differs from encoded CodeStream reuse: this
+    // image_info is the output buffer layout used immediately for decoding.
+    //
+    // nvimgcodecImageCreate's [in,out] image parameter contract (see
+    // include/nvimgcodec.h): when *image is non-NULL on input, the existing
+    // handle is reused in-place and no fresh allocation occurs. We pass
+    // image_.get() (already non-NULL on this path), so new_image after the
+    // call is the same handle owned by image_; nothing leaks. Coverity cannot
+    // see the cross-function API contract and conservatively flags new_image
+    // as allocated-and-leaked.
     nvimgcodecImage_t new_image = image_.get();
+    // coverity[leaked_storage : FALSE]
     CHECK_NVIMGCODEC(nvimgcodecImageCreate(instance_, &new_image, image_info));
     assert(new_image == image_.get());
 
@@ -813,11 +942,16 @@ void Image::reuse(nvimgcodecImageInfo_t* image_info)
 void Image::exportToPython(py::module& m)
 {
     // clang-format off
-    py::class_<Image>(m, "Image", 
-            R"pbdoc(Class which wraps buffer with pixels. It can be decoded pixels or pixels to encode.
+    py::class_<Image>(m, "Image",
+            R"pbdoc(A pixel buffer with associated metadata. Holds either decoded pixels or pixels that are to be encoded.
 
-            At present, the image must always have a three-dimensional shape in the HWC layout (height, width, channels), 
-            which is also known as the interleaved format, and be stored as a contiguous array in C-style, but rows can have additional padding.
+            The buffer's layout is reflected in the image's ``shape`` and ``sample_format``:
+
+            * Interleaved (``I_*`` sample formats): 3-D shape ``(H, W, C)``.
+            * Planar (``P_*`` sample formats): 3-D shape ``(C, H, W)``.
+
+            The buffer is C-style contiguous along all axes except the row stride,
+            which may include padding.
             )pbdoc")
         .def_property_readonly("__array_interface__", &Image::array_interface,
             R"pbdoc(
@@ -874,6 +1008,10 @@ void Image::exportToPython(py::module& m)
             R"pbdoc(
             The height of the image in pixels.
             )pbdoc")
+        .def_property_readonly("num_channels", &Image::num_channels,
+            R"pbdoc(
+            The overall number of channels in the image across all planes.
+            )pbdoc")
         .def_property_readonly("ndim", &Image::getNdim,
             R"pbdoc(
             The number of dimensions in the image.
@@ -882,9 +1020,14 @@ void Image::exportToPython(py::module& m)
             R"pbdoc(
             The data type (dtype) of the image samples.
             )pbdoc")
-        .def_property_readonly("precision", &Image::precision, 
+        .def_property_readonly("precision", &Image::precision,
             R"pbdoc(
-            Maximum number of significant bits in data type. Value 0 means that precision is equal to data type bit depth.
+            Number of significant bits per sample.
+
+            For lower-precision data stored in a wider container (e.g. 12-bit values held in a uint16 buffer)
+            this is the bitdepth set explicitly by the caller (e.g. via ``nvimgcodec.as_image(arr, precision=12)``).
+            When no explicit precision was provided, this returns the full bitdepth of the sample data type
+            (8 for ``uint8``, 16 for ``uint16``, 32 for ``float32``, etc.).
             )pbdoc")
         .def_property_readonly("sample_format", &Image::getSampleFormat, 
             R"pbdoc(
@@ -893,6 +1036,14 @@ void Image::exportToPython(py::module& m)
         .def_property_readonly("color_spec", &Image::getColorSpec, 
             R"pbdoc(
             Color specification of the image indicating how the color information in image samples should be interpreted.
+            )pbdoc")
+        .def_property_readonly("device_id", &Image::getDeviceId,
+            R"pbdoc(
+            The CUDA device id associated with this image's buffer, or ``None`` if the image is in host (CPU) memory.
+            )pbdoc")
+        .def_property_readonly("cuda_stream", &Image::getCudaStream,
+            R"pbdoc(
+            The CUDA stream associated with this image as a Python integer, or None if the image is in host (CPU) memory.
             )pbdoc")
         .def_property_readonly("buffer_kind", &Image::getBufferKind, 
             R"pbdoc(
@@ -913,8 +1064,8 @@ void Image::exportToPython(py::module& m)
             Export the image with zero-copy conversion to a DLPack tensor. 
             
             Args:
-                cuda_stream: An optional cudaStream_t represented as a Python integer, 
-                upon which synchronization must take place in created Image.
+                cuda_stream: An optional cudaStream_t represented as a Python integer, upon which
+                             synchronization must take place in created Image.
 
             Returns:
                 DLPack tensor which is encapsulated in a PyCapsule object.
@@ -930,18 +1081,40 @@ void Image::exportToPython(py::module& m)
             )pbdoc")
         .def("cuda", &Image::cuda,
             R"pbdoc(
-            Returns a copy of this image in device memory. If this image is already in device memory, 
-            than no copy is performed and the original object is returned.  
+            Returns a copy of this image in device memory. If this image is already in device memory
+            on the same device, no copy is performed and the original object is returned. If a
+            different device_id is specified, a new image is created on the target device with the
+            content copied via peer-to-peer transfer.
             
             Args:
-                synchronize: If True (by default) it blocks and waits for copy from host to device to be finished, 
+                synchronize: If True (by default) it blocks and waits for copy to be finished, 
                              else no synchronization is executed and further synchronization needs to be done using
                              cuda stream provided by e.g. \_\_cuda_array_interface\_\_. 
+                device_id: Target device id. If equals to -1 (by default) the current device will be used.
+                           When the image is already on a GPU and a different device_id is specified,
+                           a device-to-device copy is performed.
+                cuda_stream: An optional cudaStream_t represented as a Python integer, upon which
+                             synchronization must take place. The data transfer is enqueued on this stream.
+                             Must belong to the same device as ``device_id``; passing a stream created on
+                             a different device raises ``ValueError``. Defaults to ``0``, the legacy
+                             default stream, which is per-device: the copy runs under an internal device
+                             guard set to ``device_id``, so the default stream of ``device_id`` is used.
+                             Ignored when the image is already on the target device (no copy is performed).
+
+                             Lifetime: the resulting Image's internal buffer is detached from
+                             ``cuda_stream`` before this call returns, so the Image is safe to release
+                             (let it go out of scope, ``del``, etc.) even after the caller destroys
+                             ``cuda_stream``. Other Image methods that enqueue asynchronous work
+                             (notably ``Image.cpu()``, which performs a device-to-host copy on
+                             ``cuda_stream``) must still be called while ``cuda_stream`` is alive.
+                             If ``synchronize=False``, the caller is also responsible for synchronizing
+                             ``cuda_stream`` (or a downstream consumer of it) before reading the
+                             resulting Image's contents.
 
             Returns:
                 Image object with content in device memory or None if copy could not be done.
             )pbdoc",
-            "synchronize"_a = true);
+            "synchronize"_a = true, "device_id"_a = NVIMGCODEC_DEVICE_CURRENT, "cuda_stream"_a = 0);
     // clang-format on
 }
 

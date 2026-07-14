@@ -19,9 +19,12 @@
 
 #include <nvimgcodec.h>
 #include <array>
+#include <memory>
 #include <vector>
 
 namespace nvimgcodec {
+
+struct TiffParserCache;
 
 class TIFFParserPlugin
 {
@@ -45,6 +48,7 @@ class TIFFParserPlugin
 
         const char* plugin_id_;
         const nvimgcodecFrameworkDesc_t* framework_;
+        std::shared_ptr<TiffParserCache> cache_;
     };
 
     nvimgcodecStatus_t canParse(int* result, nvimgcodecCodeStreamDesc_t* code_stream);

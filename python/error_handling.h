@@ -17,6 +17,12 @@
 
 #pragma once
 
+#include <sstream>
+#include <stdexcept>
+#include <string>
+
+#include <nvimgcodec.h>
+
 #define CHECK_CUDA(call)                                                                                          \
     {                                                                                                             \
         cudaError_t _e = (call);                                                                                  \

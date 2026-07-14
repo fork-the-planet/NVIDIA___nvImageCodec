@@ -42,6 +42,45 @@ class CommonExtEncoderTest : public ExtensionTestBase
   public:
     CommonExtEncoderTest() {}
 
+    // Reuse the decoder test's stride-mode vocabulary so encoder and decoder
+    // stride tests stay consistent.
+    using StrideMode = CommonExtDecoderTest::StrideMode;
+
+    // Re-pad the encoder's INPUT buffer per the stride mode. image_buffer_ and
+    // planar_out_buffer_ (the reference the decode is compared against) stay
+    // packed; only the buffer the encoder reads from gets per-plane row padding,
+    // so this exercises each encoder's strided-input handling without disturbing
+    // the reference. Must be called after the packed image_buffer_ is filled and
+    // the reference is built, but before the input Image is created.
+    void applyInputStridePadding(StrideMode mode)
+    {
+        if (mode == StrideMode::Contiguous)
+            return;
+        const uint32_t num_planes = image_info_.num_planes;
+        size_t packed_offsets[NVIMGCODEC_MAX_NUM_PLANES];
+        size_t padded_offsets[NVIMGCODEC_MAX_NUM_PLANES];
+        size_t packed_strides[NVIMGCODEC_MAX_NUM_PLANES];
+        size_t padded_strides[NVIMGCODEC_MAX_NUM_PLANES];
+        size_t packed_running = 0, padded_running = 0;
+        for (uint32_t p = 0; p < num_planes; ++p) {
+            packed_strides[p] = image_info_.plane_info[p].row_stride;
+            padded_strides[p] = packed_strides[p] + CommonExtDecoderTest::ExtraRowPadding(mode, p);
+            packed_offsets[p] = packed_running;
+            padded_offsets[p] = padded_running;
+            packed_running += packed_strides[p] * image_info_.plane_info[p].height;
+            padded_running += padded_strides[p] * image_info_.plane_info[p].height;
+        }
+        strided_input_buffer_.assign(padded_running, 0);
+        for (uint32_t p = 0; p < num_planes; ++p) {
+            for (uint32_t y = 0; y < image_info_.plane_info[p].height; ++y) {
+                memcpy(strided_input_buffer_.data() + padded_offsets[p] + y * padded_strides[p],
+                       image_buffer_.data() + packed_offsets[p] + y * packed_strides[p], packed_strides[p]);
+            }
+            image_info_.plane_info[p].row_stride = padded_strides[p];
+        }
+        image_info_.buffer = strided_input_buffer_.data();
+    }
+
 
     void SetUp()
     {
@@ -151,7 +190,8 @@ class CommonExtEncoderTest : public ExtensionTestBase
         }
     }
 
-    void TestEncodeDecodeSingleImage(const std::string& codec_name, nvimgcodecProcessingStatus_t expected_encode_status, bool add_alpha = false)
+    void TestEncodeDecodeSingleImage(const std::string& codec_name, nvimgcodecProcessingStatus_t expected_encode_status,
+        bool add_alpha = false, StrideMode stride_mode = StrideMode::Contiguous)
     {
         image_info_.plane_info[0].width = image_width_;
         image_info_.plane_info[0].height = image_height_;
@@ -164,6 +204,9 @@ class CommonExtEncoderTest : public ExtensionTestBase
         ConvertToPlanar();
 
         image_info_.buffer = image_buffer_.data();
+        // Optionally re-pad the encoder input (image_buffer_ / planar_out_buffer_
+        // stay packed as the reference); exercises strided-input handling.
+        applyInputStridePadding(stride_mode);
         strcpy(image_info_.codec_name, codec_name.c_str());
         nvimgcodecJpegImageInfo_t jpeg_optional_image_info = nvimgcodecJpegImageInfo_t{NVIMGCODEC_STRUCTURE_TYPE_JPEG_IMAGE_INFO, sizeof(nvimgcodecJpegImageInfo_t), 0};
         if(codec_name == "jpeg") {
@@ -174,6 +217,13 @@ class CommonExtEncoderTest : public ExtensionTestBase
         ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecImageCreate(instance_, &in_image_, &image_info_));
 
         nvimgcodecImageInfo_t encoded_image_info(image_info_);
+        // The encoded stream describes the logical (packed) image; any per-plane
+        // padding applied to the input buffer must not leak into the output
+        // descriptor (otherwise the decoded buffer would be sized with padding).
+        for (uint32_t p = 0; p < encoded_image_info.num_planes; ++p) {
+            auto& pi = encoded_image_info.plane_info[p];
+            pi.row_stride = static_cast<size_t>(pi.width) * pi.num_channels * TypeSize(pi.sample_type);
+        }
         strcpy(encoded_image_info.codec_name, codec_name.c_str());
         ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecCodeStreamCreateToHostMem(instance_, &out_code_stream_, (void*)this, &ResizeBufferStatic<CommonExtEncoderTest>, &encoded_image_info));
 
@@ -291,6 +341,28 @@ class CommonExtEncoderTest : public ExtensionTestBase
     int jpeg_optimized_huffman_;
     nvimgcodecJpeg2kBitstreamType_t jpeg2k_stream_type_;
     int jpeg2k_ht_;
+    std::vector<unsigned char> strided_input_buffer_;
 };
+
+// Emit three encode->decode round-trip test cases for a CommonExtEncoderTest-
+// derived fixture (one per input plane-stride layout), so each layout is a
+// distinct gtest case - the encoder analog of the decoder
+// DEFINE_SINGLE_IMAGE_STRIDE_TESTS macro. The fixture's SetUp must set
+// sample_format_ / color_spec_ / chroma_subsampling_ and register the codec's
+// encoder, decoder and parser extensions. CODEC is the codec name string; the
+// round-trip is expected to succeed.
+#define DEFINE_ENCODE_DECODE_STRIDE_TESTS_FOR_CODEC(FIXTURE, CODEC, ADD_ALPHA)                                       \
+    TEST_P(FIXTURE, EncodeDecodeStrideContiguous)                                                                    \
+    {                                                                                                                \
+        TestEncodeDecodeSingleImage(CODEC, NVIMGCODEC_PROCESSING_STATUS_SUCCESS, ADD_ALPHA, StrideMode::Contiguous); \
+    }                                                                                                                \
+    TEST_P(FIXTURE, EncodeDecodeStrideSamePadAllPlanes)                                                              \
+    {                                                                                                                \
+        TestEncodeDecodeSingleImage(CODEC, NVIMGCODEC_PROCESSING_STATUS_SUCCESS, ADD_ALPHA, StrideMode::SamePadAllPlanes); \
+    }                                                                                                                \
+    TEST_P(FIXTURE, EncodeDecodeStrideDiffPadPerPlane)                                                               \
+    {                                                                                                                \
+        TestEncodeDecodeSingleImage(CODEC, NVIMGCODEC_PROCESSING_STATUS_SUCCESS, ADD_ALPHA, StrideMode::DiffPadPerPlane); \
+    }
 
 }} // namespace nvimgcodec::test

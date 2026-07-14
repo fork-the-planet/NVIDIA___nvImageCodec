@@ -19,6 +19,7 @@
 
 #include <variant>
 #include <memory>
+#include <optional>
 #include <nvimgcodec.h>
 
 #include <dlpack/dlpack.h>
@@ -34,10 +35,14 @@ namespace py = pybind11;
 class ILogger;
 struct DeviceBuffer;
 struct PinnedBuffer;
+struct PageableHostBuffer;
 
 // Forward declare ImageBuffer type alias
 // nvimgcodecImageInfo_t is used when buffer is externally managed and will contain information about originally passed data
-using ImageBuffer = std::variant<std::shared_ptr<DeviceBuffer>, std::shared_ptr<PinnedBuffer>, nvimgcodecImageInfo_t>;
+using ImageBuffer = std::variant<std::shared_ptr<DeviceBuffer>,
+                                 std::shared_ptr<PinnedBuffer>,
+                                 std::shared_ptr<PageableHostBuffer>,
+                                 nvimgcodecImageInfo_t>;
 
 // Shared state that keeps tensor data alive across multiple DLPack exports.
 // This struct serves as the single ownership root for image buffers and CUDA events,
@@ -54,7 +59,15 @@ struct DLPackTensorSharedState
     ILogger* logger;
     DLManagedTensor* external_tensor;  // Non-null for imported tensors, null for owned tensors
 
-    // Constructor for owned tensors (export path)
+    // Constructor for owned tensors (export path).
+    // `buffer` is taken by value (sink pattern) and std::move'd into image_buffer in the
+    // initialiser list. Coverity's PASS_BY_VALUE checker reports this because ImageBuffer
+    // is a std::variant whose largest alternative (nvimgcodecImageInfo_t, ~2168 bytes)
+    // trips its 512-byte heuristic, but the active alternative for the shared_ptr<...>
+    // arms is small and is moved cheaply. Symmetric to the DLPackTensor export
+    // constructor (see python/dlpack_utils.cpp). If a future maintainer wants to silence
+    // the checker structurally, change to `const ImageBuffer&` and drop the std::move.
+    // coverity[pass_by_value : INTENTIONAL]
     explicit DLPackTensorSharedState(ImageBuffer buffer, ILogger* log)
         : image_buffer(std::move(buffer)), logger(log), external_tensor(nullptr) {}
     
@@ -87,7 +100,9 @@ class DLPackTensor final
     const DLTensor& operator*() const;
     DLTensor& operator*();
 
-    void getImageInfo(nvimgcodecImageInfo_t* image_info);
+    void getImageInfo(nvimgcodecImageInfo_t* image_info,
+        std::optional<nvimgcodecSampleFormat_t> sample_format = std::nullopt,
+        std::optional<nvimgcodecColorSpec_t> color_spec = std::nullopt);
     py::capsule getPyCapsule(intptr_t consumer_stream, cudaStream_t producer_stream);
 
   private:

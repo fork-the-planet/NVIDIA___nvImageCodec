@@ -19,8 +19,10 @@
 #include <tiffio.h>
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <future>
+#include <limits>
 
 #define NOMINMAX
 #include <nvtx3/nvtx3.hpp>
@@ -31,6 +33,9 @@
 #include "imgproc/color_space_conversion_impl.h"
 #include "imgproc/convert.h"
 #include "imgproc/out_of_bound_roi_fill.h"
+#include "imgproc/region_orientation.h"
+#include "imgproc/image_info_checks.h"
+#include "imgproc/safe_arithmetic.h"
 
 namespace libtiff {
 
@@ -212,6 +217,19 @@ TiffInfo GetTiffInfo(TIFF* tiffptr)
     }
 
     return info;
+}
+
+bool IsJpegYcbcr(const TiffInfo& info)
+{
+    return info.photometric_interpretation == PHOTOMETRIC_YCBCR && info.compression == COMPRESSION_JPEG;
+}
+
+bool IsSupportedPhotometric(const TiffInfo& info)
+{
+    return info.photometric_interpretation == PHOTOMETRIC_RGB ||
+           info.photometric_interpretation == PHOTOMETRIC_MINISBLACK ||
+           info.photometric_interpretation == PHOTOMETRIC_PALETTE ||
+           IsJpegYcbcr(info);
 }
 
 template <int depth>
@@ -412,7 +430,9 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(
             if (region.ndim == 0) {
                 // no ROI, okay
             } else if (region.ndim == 2) {
-                if (nvimgcodec::is_region_out_of_bounds(region, cs_image_info.plane_info[0].width, cs_image_info.plane_info[0].height)) {
+                if (nvimgcodec::is_region_out_of_bounds_effective(region, image_info.orientation,
+                        cs_image_info.plane_info[0].width, cs_image_info.plane_info[0].height,
+                        params->apply_exif_orientation)) {
                     NVIMGCODEC_LOG_WARNING(framework_, plugin_id_, "Out of bounds region is not supported.");
                     status |= NVIMGCODEC_PROCESSING_STATUS_ROI_UNSUPPORTED;
                 }
@@ -448,6 +468,10 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(
                 plugin_id_,
                 "libTIFF extension can only decode to a type that has full precision (like 8 bits, not 6)."
             );
+        }
+
+        if (!nvimgcodec::check_planes_consistency(framework_, plugin_id_, image_info)) {
+            status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
         }
 
         if (image_info.num_planes == 1) {
@@ -539,10 +563,18 @@ template <typename Output, typename Input>
 nvimgcodecProcessingStatus_t decodeImplTyped2(
     const char* plugin_id, const nvimgcodecFrameworkDesc_t* framework,  const nvimgcodecCodeStreamDesc_t* code_stream, const nvimgcodecImageInfo_t& image_info, const nvimgcodecDecodeParams_t* params, TIFF* tiff, const TiffInfo& info)
 {
-    if (info.photometric_interpretation != PHOTOMETRIC_RGB && info.photometric_interpretation != PHOTOMETRIC_MINISBLACK &&
-        info.photometric_interpretation != PHOTOMETRIC_PALETTE) {
-        NVIMGCODEC_LOG_ERROR(framework, plugin_id, "Unsupported photometric interpretation: " << info.photometric_interpretation);
+    if (!IsSupportedPhotometric(info)) {
+        NVIMGCODEC_LOG_ERROR(framework, plugin_id,
+            "Unsupported photometric interpretation: " << info.photometric_interpretation <<
+            ", compression: " << info.compression);
         return NVIMGCODEC_PROCESSING_STATUS_CODESTREAM_UNSUPPORTED;
+    }
+
+    if (IsJpegYcbcr(info)) {
+        if (!TIFFSetField(tiff, TIFFTAG_JPEGCOLORMODE, JPEGCOLORMODE_RGB)) {
+            NVIMGCODEC_LOG_ERROR(framework, plugin_id, "Could not configure libtiff JPEG YCbCr RGB conversion");
+            return NVIMGCODEC_PROCESSING_STATUS_CODESTREAM_UNSUPPORTED;
+        }
     }
 
     if (info.is_planar) {
@@ -665,12 +697,33 @@ nvimgcodecProcessingStatus_t decodeImplTyped2(
     }
 
     bool convert_needed = info.bit_depth != (sizeof(Input) * 8) || info.is_palette;
+
     Input* in;
     std::vector<uint8_t> scratch;
+    size_t tile_element_count = 0;
     if (!convert_needed) {
         in = static_cast<Input*>(buf.get());
     } else {
-        scratch.resize(info.tile_height * info.tile_width * info.channels * sizeof(Input));
+        // tile_height * tile_width * channels was originally computed in uint32
+        // arithmetic and could wrap when fed crafted TIFF metadata, producing an
+        // undersized scratch buffer that later writes overrun. Compute it in
+        // size_t with overflow checks so the wrap can no longer occur. Both this
+        // count and the byte-size derived from it are only consumed below in the
+        // conversion branch, so the checks live here.
+        if (!nvimgcodec::SafeMul3SizeT(info.tile_height, info.tile_width, info.channels, tile_element_count)) {
+            NVIMGCODEC_LOG_ERROR(framework, plugin_id,
+                "Overflow computing TIFF tile element count from tile_height=" << info.tile_height
+                << ", tile_width=" << info.tile_width << ", channels=" << info.channels);
+            return NVIMGCODEC_PROCESSING_STATUS_CODESTREAM_UNSUPPORTED;
+        }
+        size_t scratch_nbytes = 0;
+        if (!nvimgcodec::SafeMulSizeT(tile_element_count, sizeof(Input), scratch_nbytes)) {
+            NVIMGCODEC_LOG_ERROR(framework, plugin_id,
+                "Overflow computing TIFF tile scratch byte count from element_count="
+                << tile_element_count << ", elem_size=" << sizeof(Input));
+            return NVIMGCODEC_PROCESSING_STATUS_CODESTREAM_UNSUPPORTED;
+        }
+        scratch.resize(scratch_nbytes);
         in = reinterpret_cast<Input*>(scratch.data());
     }
 
@@ -704,7 +757,10 @@ nvimgcodecProcessingStatus_t decodeImplTyped2(
                         framework, plugin_id, "Conversion is not supported for FP32 image.");
                     return NVIMGCODEC_PROCESSING_STATUS_CODESTREAM_UNSUPPORTED;
                 } else {
-                    size_t input_values = info.tile_height * info.tile_width * info.channels;
+                    // tile_element_count was computed once above with overflow
+                    // checking; reuse it here so the decode and convert paths
+                    // can never disagree on the buffer footprint.
+                    size_t input_values = tile_element_count;
                     if (info.is_palette)
                         input_values /= info.channels;
                     TiffConvert(info, in, buf.get(), input_values);
@@ -730,11 +786,31 @@ nvimgcodecProcessingStatus_t decodeImplTyped2(
                         }
                     }
                 } else if (info.channels >= 3) {
-                    size_t plane_stride = image_info.plane_info[0].height * image_info.plane_info[0].row_stride / sizeof(Output);
+                    // Per-plane offset / stride. The C image_info contract
+                    // allows per-plane dimensions (e.g. subsampled chroma),
+                    // and an external reuse buffer may report per-plane row
+                    // strides; build dst offsets from each plane's own
+                    // row_stride * height (overflow checked).
+                    size_t plane_offsets_bytes[NVIMGCODEC_MAX_NUM_PLANES];
+                    if (!nvimgcodec::SafePlaneByteOffsets(image_info, plane_offsets_bytes)) {
+                        NVIMGCODEC_LOG_ERROR(framework, plugin_id, "Plane byte offsets overflow.");
+                        return NVIMGCODEC_PROCESSING_STATUS_CODESTREAM_UNSUPPORTED;
+                    }
                     for (uint32_t c = 0; c < image_info.num_planes; c++) {
-                        auto* plane = dst + c * plane_stride;
+                        const auto& plane_info_c = image_info.plane_info[c];
+                        const int64_t plane_stride_y =
+                            static_cast<int64_t>(plane_info_c.row_stride) / sizeof(Output);
+                        // Position the tile inside plane c using that plane's own
+                        // row stride (not plane 0's, which is baked into `dst`).
+                        // Grayscale output is single-plane today, but compute it
+                        // the multi-plane-correct way so this stays right if the
+                        // plane count ever grows.
+                        auto* plane = reinterpret_cast<Output*>(
+                                          reinterpret_cast<uint8_t*>(img_out) + plane_offsets_bytes[c])
+                                      + (tile_begin_y - region_start_y) * plane_stride_y
+                                      + (tile_begin_x - region_start_x) * stride_x;
                         for (uint32_t i = 0; i < tile_size_y; i++) {
-                            auto* row = plane + i * stride_y;
+                            auto* row = plane + i * plane_stride_y;
                             auto* tile_row = src + i * tile_stride_y;
                             for (uint32_t j = 0; j < tile_size_x; j++) {
                                 auto* pixel = tile_row + j * tile_stride_x;
@@ -755,15 +831,34 @@ nvimgcodecProcessingStatus_t decodeImplTyped2(
             case NVIMGCODEC_SAMPLEFORMAT_P_RGB:
             case NVIMGCODEC_SAMPLEFORMAT_P_BGR:
             case NVIMGCODEC_SAMPLEFORMAT_P_UNCHANGED: {
-                size_t plane_stride = image_info.plane_info[0].height * image_info.plane_info[0].row_stride / sizeof(Output);
+                // Per-plane destination offsets and row strides. The running
+                // sum of row_stride * height keeps the layout correct for any
+                // per-plane dimensions the C image_info contract allows
+                // (overflow checked).
+                size_t plane_offsets_bytes[NVIMGCODEC_MAX_NUM_PLANES];
+                if (!nvimgcodec::SafePlaneByteOffsets(image_info, plane_offsets_bytes)) {
+                    NVIMGCODEC_LOG_ERROR(framework, plugin_id, "Plane byte offsets overflow.");
+                    return NVIMGCODEC_PROCESSING_STATUS_CODESTREAM_UNSUPPORTED;
+                }
                 for (uint32_t c = 0; c < image_info.num_planes; c++) {
                     uint32_t dst_p = c;
                     if (image_info.sample_format == NVIMGCODEC_SAMPLEFORMAT_P_BGR)
                         dst_p = c == 2 ? 0 : c == 0 ? 2 : c;
                     uint32_t source_channel = info.channels == 1 ? 0 : c;
-                    auto* plane = dst + dst_p * plane_stride;
+                    const int64_t plane_stride_y =
+                        static_cast<int64_t>(image_info.plane_info[dst_p].row_stride) / sizeof(Output);
+                    // Position the tile inside plane dst_p using that plane's own
+                    // row stride. `dst` bakes in the vertical offset scaled by
+                    // plane 0's stride_y, which is wrong here when planes have
+                    // different row strides, so compute the plane pointer from
+                    // img_out: plane start + per-plane vertical offset + the
+                    // horizontal offset (stride_x == 1 for planar).
+                    auto* plane = reinterpret_cast<Output*>(
+                                      reinterpret_cast<uint8_t*>(img_out) + plane_offsets_bytes[dst_p])
+                                  + (tile_begin_y - region_start_y) * plane_stride_y
+                                  + (tile_begin_x - region_start_x) * stride_x;
                     for (uint32_t i = 0; i < tile_size_y; i++) {
-                        auto* row = plane + i * stride_y;
+                        auto* row = plane + i * plane_stride_y;
                         auto* tile_row = src + i * tile_stride_y;
                         for (uint32_t j = 0; j < tile_size_x; j++) {
                             *(row + j * stride_x) = ConvertSatNorm<Output>(*(tile_row + j * tile_stride_x + source_channel));
@@ -846,7 +941,10 @@ nvimgcodecStatus_t DecoderImpl::decode(
             return ret;
         }
         XM_CHECK_NULL(code_stream);
-        nvimgcodecCodeStreamInfo_t codestream_info{NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_INFO, sizeof(nvimgcodecCodeStreamInfo_t), nullptr};
+        nvimgcodecCodeStreamInfoTiffExt_t tiff_ext{
+            NVIMGCODEC_STRUCTURE_TYPE_TIFF_CODE_STREAM_INFO, sizeof(nvimgcodecCodeStreamInfoTiffExt_t), nullptr};
+        nvimgcodecCodeStreamInfo_t codestream_info{
+            NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_INFO, sizeof(nvimgcodecCodeStreamInfo_t), &tiff_ext};
         ret = code_stream->getCodeStreamInfo(code_stream->instance, &codestream_info);
         if (ret != NVIMGCODEC_STATUS_SUCCESS) {
             NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Could not retrieve code stream information");
@@ -871,17 +969,27 @@ nvimgcodecStatus_t DecoderImpl::decode(
             bitstream_offset = codestream_info.code_stream_view->bitstream_offset;
         }
 
-        // Navigate to the correct IFD:
-        // 1. If bitstream_offset is set, first navigate to that absolute byte offset
-        // 2. Then, if image_idx is non-zero, navigate to that directory relative to current position
-        if (bitstream_offset != 0) {
+        if (bitstream_offset != 0 && image_idx != 0) {
+            NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "image_idx cannot be combined with bitstream_offset for TIFF IFD views");
+            image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_FAIL);
+            return NVIMGCODEC_STATUS_INVALID_PARAMETER;
+        }
+
+        // Navigate to the selected IFD. The TIFF parser resolves image_idx and
+        // bitstream_offset views to an absolute IFD offset when the extension is requested.
+        if (codestream_info.code_stream_view && tiff_ext.ifd_offset != 0) {
+            if (!TIFFSetSubDirectory(tiff.get(), tiff_ext.ifd_offset)) {
+                NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Failed to set TIFF subdirectory at offset " << tiff_ext.ifd_offset);
+                image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_CODESTREAM_UNSUPPORTED);
+                return NVIMGCODEC_STATUS_EXECUTION_FAILED;
+            }
+        } else if (bitstream_offset != 0) {
             if (!TIFFSetSubDirectory(tiff.get(), bitstream_offset)) {
                 NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Failed to set TIFF subdirectory at offset " << bitstream_offset);
                 image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_CODESTREAM_UNSUPPORTED);
                 return NVIMGCODEC_STATUS_EXECUTION_FAILED;
             }
-        }
-        if (image_idx != 0) {
+        } else if (image_idx != 0) {
             if (image_idx >= codestream_info.num_images) {
                 NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Image index " << image_idx << " out of range (0-" << (codestream_info.num_images - 1) << ")");
                 image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_NUM_IMAGES_UNSUPPORTED);

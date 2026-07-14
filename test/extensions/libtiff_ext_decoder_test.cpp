@@ -56,10 +56,7 @@ class LibtiffExtDecoderTest : public CommonExtDecoderTestWithPathAndFormat
     }
 };
 
-TEST_P(LibtiffExtDecoderTest, SingleImage)
-{
-    TestSingleImage(image_path, sample_format);
-}
+DEFINE_SINGLE_IMAGE_STRIDE_TESTS(LibtiffExtDecoderTest)
 
 INSTANTIATE_TEST_SUITE_P(LIBTIFF_DECODE,
     LibtiffExtDecoderTest,
@@ -70,6 +67,7 @@ INSTANTIATE_TEST_SUITE_P(LIBTIFF_DECODE,
             "tiff/cat-300572_640_palette.tiff",
             "tiff/cat-300572_640_grayscale.tiff",
             "tiff/cat-300572_640_no_compression.tiff",
+            "tiff/cat-300572_640_ycbcr.tiff",
             "tiff/cat-300572_640_fp32.tiff"
         ), Values (
             NVIMGCODEC_SAMPLEFORMAT_I_RGB,
@@ -80,6 +78,52 @@ INSTANTIATE_TEST_SUITE_P(LIBTIFF_DECODE,
             NVIMGCODEC_SAMPLEFORMAT_P_UNCHANGED,
             NVIMGCODEC_SAMPLEFORMAT_P_Y
         )
+    )
+);
+
+// Higher-precision (uint16 / fp32) reference decode tests: same extension setup
+// as LibtiffExtDecoderTest, driven through the path+format+type fixture.
+class LibtiffExtDecoderTestHighPrec : public CommonExtDecoderTestWithPathFormatAndType
+{
+  public:
+    void SetUp() override
+    {
+        CommonExtDecoderTestWithPathFormatAndType::SetUp();
+
+        nvimgcodecExtensionDesc_t tiff_parser_extension_desc{
+            NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_tiff_parser_extension_desc(&tiff_parser_extension_desc));
+        extensions_.emplace_back();
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &tiff_parser_extension_desc));
+
+        nvimgcodecExtensionDesc_t libtiff_extension_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_libtiff_extension_desc(&libtiff_extension_desc));
+        extensions_.emplace_back();
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &libtiff_extension_desc));
+
+        CommonExtDecoderTestWithPathFormatAndType::CreateDecoder();
+    }
+};
+
+DEFINE_SINGLE_IMAGE_HIGHPREC_STRIDE_TESTS(LibtiffExtDecoderTestHighPrec)
+
+INSTANTIATE_TEST_SUITE_P(LIBTIFF_DECODE_HIGHPREC_UINT16,
+    LibtiffExtDecoderTestHighPrec,
+    Combine(
+        Values("tiff/cat-300572_640_uint16.tiff"),
+        Values(NVIMGCODEC_SAMPLEFORMAT_I_RGB, NVIMGCODEC_SAMPLEFORMAT_I_BGR,
+               NVIMGCODEC_SAMPLEFORMAT_P_RGB, NVIMGCODEC_SAMPLEFORMAT_P_BGR),
+        Values(NVIMGCODEC_SAMPLE_DATA_TYPE_UINT16)
+    )
+);
+
+INSTANTIATE_TEST_SUITE_P(LIBTIFF_DECODE_HIGHPREC_FP32,
+    LibtiffExtDecoderTestHighPrec,
+    Combine(
+        Values("tiff/cat-300572_640_fp32.tiff"),
+        Values(NVIMGCODEC_SAMPLEFORMAT_I_RGB, NVIMGCODEC_SAMPLEFORMAT_I_BGR,
+               NVIMGCODEC_SAMPLEFORMAT_P_RGB, NVIMGCODEC_SAMPLEFORMAT_P_BGR),
+        Values(NVIMGCODEC_SAMPLE_DATA_TYPE_FLOAT32)
     )
 );
 

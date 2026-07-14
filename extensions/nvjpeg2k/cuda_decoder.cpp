@@ -17,7 +17,6 @@
 #define NOMINMAX
 
 #include "cuda_decoder.h"
-#include <imgproc/device_guard.h>
 #include <imgproc/stream_device.h>
 #include <nvimgcodec.h>
 #include <nvjpeg2k.h>
@@ -36,7 +35,11 @@
 #include "imgproc/convert_kernel_gpu.h"
 #include "imgproc/device_buffer.h"
 #include "imgproc/out_of_bound_roi_fill.h"
+#include "imgproc/region_orientation.h"
+#include "imgproc/image_info_checks.h"
+#include "imgproc/safe_arithmetic.h"
 #include "imgproc/sample_format_utils.h"
+#include "nvjpeg2k_utils.h"
 #include "log.h"
 
 using nvimgcodec::DeviceBuffer;
@@ -181,6 +184,7 @@ struct DecoderImpl
     std::vector<PerThreadResources> per_thread_;
     PerTileResourcesPool per_tile_res_;
 
+    Nvjpeg2kVersion nvjpeg2k_version_;
 
 };
 
@@ -248,7 +252,9 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(const nvimgcodecImageDesc_t*
             if (region.ndim == 0) {
                 // no ROI, okay
             } else if (region.ndim == 2) {
-                if (nvimgcodec::is_region_out_of_bounds(region, cs_image_info.plane_info[0].width, cs_image_info.plane_info[0].height)) {
+                if (nvimgcodec::is_region_out_of_bounds_effective(region, image_info.orientation,
+                        cs_image_info.plane_info[0].width, cs_image_info.plane_info[0].height,
+                        params->apply_exif_orientation)) {
                     if (auto err_message = nvimgcodec::verify_region_fill_support(region, image_info); !err_message.empty()) {
                         status |= NVIMGCODEC_PROCESSING_STATUS_ROI_UNSUPPORTED;
                         NVIMGCODEC_LOG_WARNING(framework_, plugin_id_, err_message);
@@ -294,6 +300,14 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(const nvimgcodecImageDesc_t*
             status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_FORMAT_UNSUPPORTED;
         }
 
+        constexpr Nvjpeg2kVersion nvjpeg2k_ycc_rgb_444_version_fix = {0, 11, 0};
+        if (cs_image_info.color_spec == NVIMGCODEC_COLORSPEC_SYCC && image_info.color_spec == NVIMGCODEC_COLORSPEC_SRGB &&
+            cs_image_info.chroma_subsampling == NVIMGCODEC_SAMPLING_444 && nvjpeg2k_version_ < nvjpeg2k_ycc_rgb_444_version_fix
+        ) {
+            NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Conversion from YCC to RGB with 444 subsampling is not supported with nvJPEG2k < 0.11. Please update to a newer version.");
+            status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_FORMAT_UNSUPPORTED;
+        }
+
         static const std::set<nvimgcodecSampleDataType_t> supported_sample_type{
             NVIMGCODEC_SAMPLE_DATA_TYPE_UINT8, NVIMGCODEC_SAMPLE_DATA_TYPE_UINT16, NVIMGCODEC_SAMPLE_DATA_TYPE_INT16};
         for (uint32_t p = 0; p < image_info.num_planes; ++p) {
@@ -301,6 +315,9 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(const nvimgcodecImageDesc_t*
             if (supported_sample_type.find(sample_type) == supported_sample_type.end()) {
                 status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
             }
+        }
+        if (!nvimgcodec::check_planes_consistency(framework_, plugin_id_, image_info)) {
+            status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
         }
         return status;
     } catch (const NvJpeg2kException& e) {
@@ -347,7 +364,12 @@ DecoderImpl::DecoderImpl(
     , pinned_allocator_{nullptr, nullptr, nullptr}
     , framework_(framework)
     , exec_params_(exec_params)
+    , nvjpeg2k_version_(get_nvjpeg2k_version())
 {
+    if (!nvjpeg2k_version_) {
+        throw NvJpeg2kException(NVIMGCODEC_STATUS_EXTENSION_EXECUTION_FAILED, "Failed to get nvJPEG2000 version");
+    }
+
     parseOptions(options);
     if (exec_params_->device_allocator && exec_params_->device_allocator->device_malloc && exec_params_->device_allocator->device_free) {
         device_allocator_.device_ctx = exec_params_->device_allocator->device_ctx;
@@ -470,7 +492,11 @@ nvimgcodecStatus_t DecoderImpl::static_destroy(nvimgcodecDecoder_t decoder)
 nvimgcodecStatus_t DecoderImpl::decode(
     const nvimgcodecImageDesc_t* image, const nvimgcodecCodeStreamDesc_t* code_stream, const nvimgcodecDecodeParams_t* params, int thread_idx)
 {
-    assert(code_stream->io_stream);
+    if (!code_stream->io_stream) {
+        NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "No io stream");
+        image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_FAIL);
+        return NVIMGCODEC_STATUS_EXECUTION_FAILED;
+    }
     void* encoded_stream_data = nullptr;
     size_t encoded_stream_data_size = 0;
     if (code_stream->io_stream->size(code_stream->io_stream->instance, &encoded_stream_data_size) != NVIMGCODEC_STATUS_SUCCESS) {
@@ -504,11 +530,7 @@ nvimgcodecStatus_t DecoderImpl::decode(
             return NVIMGCODEC_STATUS_EXECUTION_FAILED;
         }
         unsigned char* device_buffer = reinterpret_cast<unsigned char*>(image_info.buffer);
-        if(!code_stream->io_stream){
-            NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "No io stream");
-            image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_FAIL);
-            return NVIMGCODEC_STATUS_EXECUTION_FAILED;
-        }
+        // io_stream is null-checked at function entry, before any deref.
         if (code_stream->io_stream->id != t.parsed_stream_id_) {
             nvtx3::scoped_range marker{"nvjpegJpegStreamParse"};
             XM_CHECK_NVJPEG2K(nvjpeg2kStreamParse(handle_, static_cast<const unsigned char*>(encoded_stream_data), encoded_stream_data_size,
@@ -704,6 +726,14 @@ nvimgcodecStatus_t DecoderImpl::decode(
         int roi_height = roi_y_end - roi_y_begin;
         int roi_width = roi_x_end - roi_x_begin;
 
+        if (roi_width <= 0 || roi_height <= 0 || num_components == 0) {
+            NVIMGCODEC_LOG_ERROR(framework_, plugin_id_,
+                "Invalid ROI or component count: roi=" << roi_width << "x" << roi_height
+                << ", components=" << num_components);
+            image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_FAIL);
+            return NVIMGCODEC_STATUS_EXECUTION_FAILED;
+        }
+
         for (size_t p = 0; p < image_info.num_planes; p++) {
             if (static_cast<int>(image_info.plane_info[p].height) != roi_height ||
                 static_cast<int>(image_info.plane_info[p].width) != roi_width
@@ -714,9 +744,32 @@ nvimgcodecStatus_t DecoderImpl::decode(
             }
         }
 
-        size_t planar_in_row_nbytes = in_bytes_per_sample * roi_width;
-        size_t planar_in_plane_nbytes = planar_in_row_nbytes * roi_height;
-        size_t planar_out_row_nbytes = roi_width * out_bytes_per_sample;
+        // roi_width/roi_height/num_components/bps all derive from the codestream
+        // header and are therefore attacker-controlled. The individual products
+        // below are computed in size_t (because in/out_bytes_per_sample are size_t),
+        // but the *result* can still overflow size_t — e.g. a SIZ marker claiming
+        // image_width == image_height == 2^31 wraps planar_in_plane_nbytes and
+        // produces an undersized t.device_buffer_.resize() at the needs_convert /
+        // planar_subset branches, after which the decode writes overrun.
+        size_t planar_in_row_nbytes = 0;
+        size_t planar_in_plane_nbytes = 0;
+        size_t planar_out_row_nbytes = 0;
+        size_t decode_buffer_nbytes = 0;
+        const size_t roi_width_sz = static_cast<size_t>(roi_width);
+        const size_t roi_height_sz = static_cast<size_t>(roi_height);
+        const size_t num_components_sz = static_cast<size_t>(num_components);
+        if (!nvimgcodec::SafeMulSizeT(in_bytes_per_sample, roi_width_sz, planar_in_row_nbytes) ||
+            !nvimgcodec::SafeMulSizeT(planar_in_row_nbytes, roi_height_sz, planar_in_plane_nbytes) ||
+            !nvimgcodec::SafeMulSizeT(roi_width_sz, out_bytes_per_sample, planar_out_row_nbytes) ||
+            !nvimgcodec::SafeMulSizeT(planar_in_plane_nbytes, num_components_sz, decode_buffer_nbytes)) {
+            NVIMGCODEC_LOG_ERROR(framework_, plugin_id_,
+                "Image dimensions overflow size_t: roi=" << roi_width << "x" << roi_height
+                << ", components=" << num_components
+                << ", in_bps=" << in_bytes_per_sample
+                << ", out_bps=" << out_bytes_per_sample);
+            image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_FAIL);
+            return NVIMGCODEC_STATUS_EXECUTION_FAILED;
+        }
 
         uint8_t* decode_buffer = nullptr;
         std::vector<unsigned char*> decode_output(num_components);
@@ -729,7 +782,7 @@ nvimgcodecStatus_t DecoderImpl::decode(
             pitch_in_bytes[0] = image_info.plane_info[0].row_stride;
         } else if (needs_convert) {
             // If there are conversions needed, we decode to a temporary buffer first
-            t.device_buffer_.resize(planar_in_plane_nbytes * num_components, image_info.cuda_stream);
+            t.device_buffer_.resize(decode_buffer_nbytes, image_info.cuda_stream);
             decode_buffer = reinterpret_cast<uint8_t*>(t.device_buffer_.data);
             for (size_t p = 0; p < num_components; p++) {
                 decode_output[p] = decode_buffer + p * planar_in_plane_nbytes;

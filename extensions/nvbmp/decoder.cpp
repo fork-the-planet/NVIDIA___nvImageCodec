@@ -14,16 +14,19 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
+#define NOMINMAX
 #include "decoder.h"
 #include <cuda_runtime_api.h>
 #include <nvimgcodec.h>
 #include <cassert>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <nvtx3/nvtx3.hpp>
 #include <vector>
 #include "error_handling.h"
+#include "imgproc/image_info_checks.h"
+#include "imgproc/safe_arithmetic.h"
 #include "log.h"
 
 namespace nvbmp {
@@ -154,6 +157,10 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(const nvimgcodecImageDesc_t*
             status |= NVIMGCODEC_PROCESSING_STATUS_NUM_PLANES_UNSUPPORTED;
         }
 
+        if (!nvimgcodec::check_planes_consistency(framework_, plugin_id_, image_info)) {
+            status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
+        }
+
         for (uint32_t p = 0; p < image_info.num_planes; ++p) {
             if (image_info.plane_info[p].sample_type != NVIMGCODEC_SAMPLE_DATA_TYPE_UINT8) {
                 status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
@@ -263,26 +270,60 @@ nvimgcodecStatus_t DecoderImpl::decode(const nvimgcodecImageDesc_t* image, const
         unsigned char* host_buffer = reinterpret_cast<unsigned char*>(image_info.buffer);
 
         if (image_info.sample_format == NVIMGCODEC_SAMPLEFORMAT_P_RGB) {
+            size_t plane_size = static_cast<size_t>(image_info.plane_info[0].width) * image_info.plane_info[0].height;
+            if (plane_size > std::numeric_limits<size_t>::max() / image_info.num_planes ||
+                kHeaderStart + header_size + plane_size * image_info.num_planes > encoded_stream_data_size
+            ) {
+                NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Code stream size is not big enough.");
+                image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_FAIL);
+                return NVIMGCODEC_STATUS_BAD_CODESTREAM;
+            }
+
+            // Byte offset of each destination plane (running sum of
+            // row_stride * height per the C image_info contract); honours
+            // per-plane row strides (padded reuse buffers) and per-plane
+            // heights (subsampled layouts), with overflow checked.
+            size_t plane_offsets[NVIMGCODEC_MAX_NUM_PLANES];
+            if (!nvimgcodec::SafePlaneByteOffsets(image_info, plane_offsets)) {
+                NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Plane byte offsets overflow.");
+                image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_FAIL);
+                return NVIMGCODEC_STATUS_BAD_CODESTREAM;
+            }
+
             for (size_t p = 0; p < image_info.num_planes; p++) {
-                for (size_t y = 0; y < image_info.plane_info[p].height; y++) {
-                    for (size_t x = 0; x < image_info.plane_info[p].width; x++) {
-                        host_buffer[(image_info.num_planes - p - 1) * image_info.plane_info[p].height * image_info.plane_info[p].width +
-                                    (image_info.plane_info[p].height - y - 1) * image_info.plane_info[p].width + x] =
+                const auto& plane = image_info.plane_info[p];
+                // BMP stores planes as B, G, R; nvimgcodec planar layout is R, G, B.
+                const size_t dst_plane_idx = image_info.num_planes - p - 1;
+                const size_t dst_row_stride = image_info.plane_info[dst_plane_idx].row_stride;
+                for (size_t y = 0; y < plane.height; y++) {
+                    for (size_t x = 0; x < plane.width; x++) {
+                        host_buffer[plane_offsets[dst_plane_idx] +
+                                    (plane.height - y - 1) * dst_row_stride + x] =
                             encoded_stream_data[kHeaderStart + header_size +
-                                                     image_info.num_planes * (y * image_info.plane_info[p].width + x) + p];
+                                                     image_info.num_planes * (y * plane.width + x) + p];
                     }
                 }
             }
             image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_SUCCESS);
             return NVIMGCODEC_STATUS_SUCCESS;
         } else if (image_info.sample_format == NVIMGCODEC_SAMPLEFORMAT_I_RGB) {
+            size_t plane_size = static_cast<size_t>(image_info.plane_info[0].width) * image_info.plane_info[0].height;
+            if (plane_size > std::numeric_limits<size_t>::max() / image_info.plane_info[0].num_channels ||
+                kHeaderStart + header_size + plane_size * image_info.plane_info[0].num_channels > encoded_stream_data_size
+            ) {
+                NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Code stream size is not big enough.");
+                image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_FAIL);
+                return NVIMGCODEC_STATUS_BAD_CODESTREAM;
+            }
+
+            // Honour the output row_stride so a padded destination buffer works.
+            const size_t row_stride = image_info.plane_info[0].row_stride;
             for (size_t c = 0; c < image_info.plane_info[0].num_channels; c++) {
                 for (size_t y = 0; y < image_info.plane_info[0].height; y++) {
                     for (size_t x = 0; x < image_info.plane_info[0].width; x++) {
                         auto src_idx = kHeaderStart + header_size +
                                        image_info.plane_info[0].num_channels * (y * image_info.plane_info[0].width + x) + c;
-                        auto dst_idx = (image_info.plane_info[0].height - y - 1) * image_info.plane_info[0].width *
-                                           image_info.plane_info[0].num_channels +
+                        auto dst_idx = (image_info.plane_info[0].height - y - 1) * row_stride +
                                        x * image_info.plane_info[0].num_channels + (image_info.plane_info[0].num_channels - c - 1);
                         host_buffer[dst_idx] = encoded_stream_data[src_idx];
                     }

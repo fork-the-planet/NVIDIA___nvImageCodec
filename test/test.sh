@@ -26,18 +26,29 @@ else
     RUN_SLOW_TESTS=$3
 fi
 
-if [ -d "/opt/.nvimgcodec_test_venv" ]; then
-    echo "Python virtual environment /opt/.nvimgcodec_test_venv already exists. Activating."
-    . /opt/.nvimgcodec_test_venv/bin/activate
-else
-    echo "Creating python virtual environment .nvimgcodec_test_venv"
-    ${PATH_TO_PYTHON} -m venv .nvimgcodec_test_venv
+PYTHON_TAG=$("${PATH_TO_PYTHON}" -c 'import sys; print(f"py{sys.version_info.major}{sys.version_info.minor}")')
+exit_code=$?
+if [ $exit_code -ne 0 ]; then exit $exit_code; fi
+
+VENV_RUN_ID=${BUILD_ID:-$$}
+VENV_DIR=".nvimgcodec_test_venv_${PYTHON_TAG}_cu${CUDA_VERSION_MAJOR}_${VENV_RUN_ID}"
+
+if [ ! -x "${VENV_DIR}/bin/python" ]; then
+    if [ -d "${VENV_DIR}" ]; then
+        echo "Removing incomplete python virtual environment ${VENV_DIR}"
+        rm -rf "${VENV_DIR}"
+    fi
+
+    echo "Creating python virtual environment ${VENV_DIR} using ${PATH_TO_PYTHON}"
+    "${PATH_TO_PYTHON}" -m venv "${VENV_DIR}"
     exit_code=$?
     if [ $exit_code -ne 0 ]; then exit $exit_code; fi
-
-    echo "Activating python virtual environment .nvimgcodec_test_venv"
-    . .nvimgcodec_test_venv/bin/activate
+else
+    echo "Using existing python virtual environment ${VENV_DIR}"
 fi
+
+echo "Activating python virtual environment ${VENV_DIR}"
+. "${VENV_DIR}/bin/activate"
 
 # Check the system architecture
 ARCH=$(uname -m)
@@ -52,28 +63,34 @@ fi
 
 echo "Installing python requirements"
 python -m pip install --upgrade pip setuptools wheel
-pip install appdirs
-pip install -r requirements_lnx_cu${CUDA_VERSION_MAJOR}.txt
+python -m pip install appdirs
+python -m pip install -r requirements_lnx_cu${CUDA_VERSION_MAJOR}.txt
 
-CUDA_PATH=$(pwd)/.nvimgcodec_test_venv/lib/site-packages/nvidia/cuda_runtime
+PYTHON_SITE_PACKAGES=$(python -c 'import site; print(site.getsitepackages()[0])')
+PYTHON_NVIDIA_LIBS="${PYTHON_SITE_PACKAGES}/nvidia"
 
-# echo trick to get correct python version (on linux venv creates python3.minor directory)
-LIB_PYTHON_DIR="$(echo "$(pwd)/.nvimgcodec_test_venv/lib/python"*)"
-PYTHON_NVIDIA_LIBS="$LIB_PYTHON_DIR/site-packages/nvidia"
+if [ -d "${PYTHON_NVIDIA_LIBS}/cu${CUDA_VERSION_MAJOR}/lib" ]; then
+    # CUDA 13+ wheels share a versioned package directory, including nvJPEG.
+    CUDA_PATH=${PYTHON_NVIDIA_LIBS}/cu${CUDA_VERSION_MAJOR}
+    export LD_LIBRARY_PATH="${CUDA_PATH}/lib/${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+else
+    # CUDA 12 and older wheels use one package directory per component.
+    CUDA_PATH=${PYTHON_NVIDIA_LIBS}/cuda_runtime
+    export LD_LIBRARY_PATH="${PYTHON_NVIDIA_LIBS}/cuda_runtime/lib/${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    export LD_LIBRARY_PATH="${PYTHON_NVIDIA_LIBS}/nvjpeg/lib/:${LD_LIBRARY_PATH}"
+fi
 
-export LD_LIBRARY_PATH=$PYTHON_NVIDIA_LIBS/cuda_runtime/lib/:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=${PYTHON_NVIDIA_LIBS}/nvjpeg2k/lib/:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=${PYTHON_NVIDIA_LIBS}/nvtiff/lib/:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=${PYTHON_NVIDIA_LIBS}/libnvcomp/lib64/:$LD_LIBRARY_PATH
 
-export LD_LIBRARY_PATH=$PYTHON_NVIDIA_LIBS/nvjpeg/lib/:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=$PYTHON_NVIDIA_LIBS/nvjpeg2k/lib/:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=$PYTHON_NVIDIA_LIBS/nvtiff/lib/:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=$PYTHON_NVIDIA_LIBS/libnvcomp/lib64/:$LD_LIBRARY_PATH
-
-export NVIMGCODEC_EXTENSIONS_PATH=$(pwd)/../extensions
+NVIMGCODEC_ARCHIVE_LIB_DIR=$(pwd)/../lib64/libnvimgcodec/${CUDA_VERSION_MAJOR}
+export LD_LIBRARY_PATH=$NVIMGCODEC_ARCHIVE_LIB_DIR:$LD_LIBRARY_PATH
 
 echo "Installing nvImageCodec python wheel(s) from current folder"
 for G in ./*.whl; do
     echo "Found and installing: $G"
-    pip install -I $G
+    python -m pip install -I "$G"
 done
 
 echo "Running transcoder (nvimtrans) tests"
@@ -105,5 +122,5 @@ echo "Running unit tests"
 exit_code=$?
 if [ $exit_code -ne 0 ]; then exit $exit_code; fi
 
-echo "Deactivating python virtual environment .nvimgcodec_test_venv"
+echo "Deactivating python virtual environment ${VENV_DIR}"
 deactivate

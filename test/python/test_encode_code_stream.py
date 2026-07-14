@@ -21,7 +21,7 @@ import numpy as np
     
 from nvidia import nvimgcodec
 from utils import *
-import nvjpeg_test_speedup
+
 
 @t.mark.parametrize(
     ("codec", "sample_type"),
@@ -191,6 +191,40 @@ def test_encode_with_previous_encode_result_code_stream_reuse():
     assert code_stream.size > 0
     assert code_stream.codec_name == "jpeg"
 
+
+def test_reused_code_stream_clears_cached_root_tiff_page_count():
+    """Reusing a previously counted TIFF root stream must not keep the old page count."""
+    root = nvimgcodec.CodeStream(os.path.join(img_dir_path, "tiff/multi_page.tif"))
+    assert root.num_images > 1
+
+    encoder = nvimgcodec.Encoder()
+    image = nvimgcodec.as_image(np.zeros((18, 24, 3), dtype=np.uint8) + 33)
+    reused = encoder.encode(image, codec="jpeg", code_stream_s=root)
+
+    assert reused.num_images == 1
+    assert reused.codec_name == "jpeg"
+    assert reused.width == 24
+    assert reused.height == 18
+
+def test_reused_code_stream_clears_input_view():
+    """Reusing a TIFF offset/page-view CodeStream as encoder output must clear the stale input
+    view, so it does not leak into `.view` or get_sub_code_stream() on the newly encoded stream."""
+    fpath = os.path.join(img_dir_path, "tiff/cat_with_thumbnail.tiff")
+    offset = nvimgcodec.CodeStream(fpath).subifd_offsets[0]
+    view_cs = nvimgcodec.CodeStream(fpath, bitstream_offset=offset)
+    assert view_cs.view is not None and view_cs.view.bitstream_offset == offset
+
+    encoder = nvimgcodec.Encoder()
+    image = nvimgcodec.as_image(np.zeros((18, 24, 3), dtype=np.uint8) + 33)
+    reused = encoder.encode(image, codec="jpeg", code_stream_s=view_cs)
+
+    assert reused is not None and reused.codec_name == "jpeg"
+    assert reused.width == 24 and reused.height == 18
+    # Regression: reuse() used to keep the input view, leaking the old IFD offset.
+    assert reused.view is None
+    # A substream of the result must not inherit the stale offset either.
+    assert reused.get_sub_code_stream(0).view.bitstream_offset != offset
+
 def test_encode_with_previous_encode_result_code_stream_reuse_batch():
     """Test reusing a CodeStream for multiple encodings in batch with previous encode result."""
     encoder = nvimgcodec.Encoder()
@@ -321,12 +355,11 @@ def test_encoded_code_stream_reused_then_get_sub():
 
 
 def test_encoded_code_stream_single_image_bounds():
-    """Single-image encoder output: num_images=1, next_bitstream_offset is None; image_idx=1 raises."""
+    """Single-image encoder output: num_images=1, next_ifd_offset is None; image_idx=1 raises on metadata access."""
     enc = nvimgcodec.Encoder().encode(nvimgcodec.as_image(np.zeros((10, 10), dtype=np.uint8)), "jpeg")
-    assert enc.num_images == 1 and enc.next_bitstream_offset is None
-    with t.raises(RuntimeError) as exc_info:
-        enc.get_sub_code_stream(image_idx=1)
-    assert "out of range" in str(exc_info.value) and "1" in str(exc_info.value)
+    assert enc.num_images == 1 and enc.next_ifd_offset is None
+    with t.raises(RuntimeError):
+        _ = enc.get_sub_code_stream(image_idx=1).width
 
 
 def test_encoded_code_stream_get_sub_invalid_kwarg_raises_type_error():
@@ -337,5 +370,64 @@ def test_encoded_code_stream_get_sub_invalid_kwarg_raises_type_error():
     assert "image_idx" in str(exc_info.value) or "incompatible" in str(exc_info.value).lower()
 
 
+# ----------------------------------------------------------------------
+# CodeStream-reuse + precision: read a CodeStream from drive (one
+# precision), then encode a NEW image with a different precision into
+# the same CodeStream via code_stream_s=. The reused CodeStream's
+# .precision must reflect the new image, not the file's original tag.
+# ----------------------------------------------------------------------
 
+@t.mark.parametrize(
+    "seed_file, seed_precision, encode_dtype, encode_precision",
+    [
+        # Seed = 8-bit J2K from drive; encode a 12-bit uint16 image into it.
+        ("jpeg2k/cat-1046544_640.jp2", 8, np.uint16, 12),
+        # Seed = 8-bit J2K from drive; encode a 16-bit uint16 image into it.
+        ("jpeg2k/cat-1046544_640.jp2", 8, np.uint16, 16),
+        # Seed = 12-bit J2K from drive; encode a sub-8-bit uint8 image into it.
+        ("jpeg2k/cat-1245673_640-12bit.jp2", 12, np.uint8, 5),
+        # Seed = 16-bit J2K from drive; encode an 8-bit uint8 image into it.
+        ("jpeg2k/cat-111793_640-16bit.jp2", 16, np.uint8, 8),
+        # Seed = 5-bit J2K from drive; encode a 12-bit uint16 image into it
+        # (cross-dtype the other way: uint8 seed -> uint16 target).
+        ("jpeg2k/cat-1245673_640-5bit.jp2", 5, np.uint16, 12),
+    ]
+)
+def test_encode_reuse_codestream_from_drive_updates_precision(
+    seed_file, seed_precision, encode_dtype, encode_precision):
+    """A CodeStream read from disk (with its file's native precision) is reused as the
+    output target of a new encode. The reused CodeStream's .precision must reflect the
+    newly-encoded image's precision, and the encoded bitstream must round-trip back to
+    the original pixel values."""
+    seed_path = os.path.join(img_dir_path, seed_file)
+    seed_cs = nvimgcodec.CodeStream(seed_path)
+    assert seed_cs.precision == seed_precision, (
+        f"sanity: {seed_file} on disk should report precision {seed_precision}, "
+        f"got {seed_cs.precision}")
 
+    rng = np.random.default_rng(1729)
+    max_value = (1 << encode_precision) - 1
+    arr = rng.integers(0, max_value + 1, (48, 64, 3), dtype=encode_dtype)
+    img = nvimgcodec.as_image(arr, precision=encode_precision)
+    assert img.precision == encode_precision
+
+    encoder = nvimgcodec.Encoder()
+    encode_params = nvimgcodec.EncodeParams(quality_type=nvimgcodec.QualityType.LOSSLESS)
+    reused = encoder.encode(img, codec="jpeg2k", params=encode_params, code_stream_s=seed_cs)
+
+    assert reused is seed_cs, "encode(code_stream_s=...) should return the reused object"
+    assert reused.precision == encode_precision, (
+        f"after reusing {seed_file} (precision {seed_precision}) for a "
+        f"{encode_dtype.__name__} precision={encode_precision} encode, "
+        f"expected reused.precision={encode_precision}, got {reused.precision}")
+    assert reused.codec_name == "jpeg2k"
+    assert reused.width == 64
+    assert reused.height == 48
+
+    # Round-trip: decoding the reused CodeStream's bytestream must yield the original pixels.
+    decoder = nvimgcodec.Decoder()
+    decoded = decoder.decode(reused, params=nvimgcodec.DecodeParams(
+        color_spec=nvimgcodec.ColorSpec.UNCHANGED, allow_any_depth=True))
+    assert decoded.precision == encode_precision
+    assert np.dtype(decoded.dtype) == np.dtype(encode_dtype)
+    np.testing.assert_array_equal(np.asarray(decoded.cpu()), arr)

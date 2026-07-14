@@ -117,6 +117,16 @@ struct SampleEntry : public IImage
     nvimgcodecImageInfo_t image_info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};
     ProcessorEntry* processor = nullptr;
     bool should_copy = false;
+    // Per-submission params, set in initState() AFTER executor->wait() drains
+    // the previous submission. Read by workers via
+    // static_cast<const nvimgcodec{Encode,Decode}Params_t*>(params).
+    //
+    // Aliases caller-owned storage. Per the public C API contract, the caller
+    // of encode()/decode() must keep their params struct alive and unmodified
+    // until the returned future resolves.
+    //
+    // Written only in initState(); never read after the future resolves.
+    const void* params = nullptr;
 };
 
 struct PerThread
@@ -278,8 +288,22 @@ class ImageGenericCodec
     struct PostSyncCompletionFunction {
         ImageGenericCodec* codec_ptr;
         int stream_idx;
-        void operator()() noexcept { 
-            codec_ptr->completePostSync(stream_idx); 
+        void operator()() noexcept {
+            // completePostSync calls into ProcessingResultsPromise::set, which can
+            // throw std::runtime_error.  This functor is declared noexcept and is
+            // invoked from a thread-pool barrier callback, so an escaping
+            // exception would call std::terminate.
+            try {
+                codec_ptr->completePostSync(stream_idx);
+            } catch (const std::exception& e) {
+                if (codec_ptr && codec_ptr->logger_)
+                    NVIMGCODEC_LOG_ERROR(codec_ptr->logger_,
+                        "completePostSync threw: " << e.what());
+            } catch (...) {
+                if (codec_ptr && codec_ptr->logger_)
+                    NVIMGCODEC_LOG_ERROR(codec_ptr->logger_,
+                        "completePostSync threw an unknown exception");
+            }
         }
     };
 
@@ -290,11 +314,23 @@ class ImageGenericCodec
 
         PostSyncGuard(ImageGenericCodec* c, int thread_id) : codec(c), tid(thread_id) {}
         ~PostSyncGuard() {
-            if (codec) {
+            if (!codec) return;
+            // postSync's call chain reaches ProcessingResultsPromise::set, which
+            // can throw std::runtime_error; a destructor must not propagate
+            // exceptions.
+            try {
                 codec->postSync(tid);
+            } catch (const std::exception& e) {
+                if (codec->logger_)
+                    NVIMGCODEC_LOG_ERROR(codec->logger_,
+                        "postSync threw during cleanup: " << e.what());
+            } catch (...) {
+                if (codec->logger_)
+                    NVIMGCODEC_LOG_ERROR(codec->logger_,
+                        "postSync threw an unknown exception during cleanup");
             }
         }
-        
+
         PostSyncGuard(const PostSyncGuard&) = delete;
         PostSyncGuard& operator=(const PostSyncGuard&) = delete;
     };
@@ -309,9 +345,42 @@ class ImageGenericCodec
         nvimgcodecBackendParams_t backend_params_;
         size_t sample_count_hint_ = 0;
         size_t assigned_batch_size_ = 0;
-        std::unique_ptr<std::atomic<size_t>> elligible_samples_ = std::make_unique<std::atomic<size_t>>(0);
+        std::atomic<size_t> elligible_samples_{0};
         size_t sample_count_ = 0;
         ProcessorEntry* fallback_ = nullptr;
+        bool has_batched_api = false;
+
+        ProcessorEntry() = default;
+        ProcessorEntry(const ProcessorEntry&) = delete;
+        ProcessorEntry& operator=(const ProcessorEntry&) = delete;
+        ProcessorEntry(ProcessorEntry&& o) noexcept
+            : factory_(o.factory_)
+            , instance_(std::move(o.instance_))
+            , id_(std::move(o.id_))
+            , backend_kind_(o.backend_kind_)
+            , backend_params_(o.backend_params_)
+            , sample_count_hint_(o.sample_count_hint_)
+            , assigned_batch_size_(o.assigned_batch_size_)
+            , elligible_samples_(o.elligible_samples_.load(std::memory_order_relaxed))
+            , sample_count_(o.sample_count_)
+            , fallback_(o.fallback_)
+            , has_batched_api(o.has_batched_api)
+        {}
+        ProcessorEntry& operator=(ProcessorEntry&& o) noexcept
+        {
+            factory_ = o.factory_;
+            instance_ = std::move(o.instance_);
+            id_ = std::move(o.id_);
+            backend_kind_ = o.backend_kind_;
+            backend_params_ = o.backend_params_;
+            sample_count_hint_ = o.sample_count_hint_;
+            assigned_batch_size_ = o.assigned_batch_size_;
+            elligible_samples_.store(o.elligible_samples_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            sample_count_ = o.sample_count_;
+            fallback_ = o.fallback_;
+            has_batched_api = o.has_batched_api;
+            return *this;
+        }
     };
 
     explicit ImageGenericCodec(ILogger* logger, 
@@ -332,6 +401,8 @@ class ImageGenericCodec
         if (exec_params_.device_id == NVIMGCODEC_DEVICE_CURRENT) {
             CHECK_CUDA(cudaGetDevice(&exec_params_.device_id));
         }
+
+        DeviceGuard device_guard(exec_params_.device_id);
 
         auto backend = exec_params->backends;
         for (int i = 0; i < exec_params->num_backends; ++i) {
@@ -458,13 +529,14 @@ class ImageGenericCodec
                 processor.id_ = Impl::getId(factory);
                 processor.factory_ = factory;
                 processor.sample_count_ = 0;
-                processor.elligible_samples_ = std::make_unique<std::atomic<size_t>>(0);
+                processor.elligible_samples_.store(0, std::memory_order_relaxed);
 
                 if (exec_params->pre_init) {
                     NVIMGCODEC_LOG_INFO(logger_, "create " << processor.id_ << " load_hint " << processor.backend_params_.load_hint
                                                            << " load_hint_policy " << processor.backend_params_.load_hint_policy);
                     processor.instance_ = Impl::createInstance(processor.factory_, &exec_params_, options_.c_str());
-                    if (Impl::hasBatchedAPI(processor.instance_.get()))
+                    processor.has_batched_api = Impl::hasBatchedAPI(processor.instance_.get());
+                    if (processor.has_batched_api)
                         batched_processors_.insert(&processor);
                 }
                 if (!first_processor) {
@@ -499,6 +571,16 @@ class ImageGenericCodec
 
     virtual ~ImageGenericCodec()
     {
+        // drain executor first
+        executor_.reset();
+
+        std::optional<DeviceGuard> device_guard;
+        try {
+            device_guard.emplace(exec_params_.device_id);
+        } catch (const std::exception& e) {
+            NVIMGCODEC_LOG_ERROR(logger_, "Could not set CUDA device during " << Impl::process_name() << " teardown: " << e.what());
+        }
+
         // deallocate temp buffers before we destroy thread resources
         samples_.clear();
         // destroy processors
@@ -546,8 +628,6 @@ class ImageGenericCodec
 
     std::vector<int> curr_order_;
     std::shared_ptr<ProcessingResultsPromise> curr_promise_;
-
-    const nvimgcodecDecodeParams_t* curr_params_;
 
     std::chrono::time_point<std::chrono::high_resolution_clock> start_iteration_time_ =
         std::chrono::time_point<std::chrono::high_resolution_clock>::min();
@@ -609,11 +689,8 @@ class ImageGenericCodec
         
         std::set<cudaStream_t> user_streams_copy;
         std::vector<std::pair<int, nvimgcodecProcessingStatus_t>> processed_samples_copy;
-        {
-            std::lock_guard<std::mutex> lock(s.mutex_);
-            std::swap(user_streams_copy, s.user_streams);
-            std::swap(processed_samples_copy, s.processed_samples);
-        }
+        std::swap(user_streams_copy, s.user_streams);
+        std::swap(processed_samples_copy, s.processed_samples);
         try {
             if (!user_streams_copy.empty()) {
                 // Record the current state of our processing stream once
@@ -696,7 +773,7 @@ class ImageGenericCodec
             } else {
                 sample.status = static_cast<Impl*>(this)->canProcessImpl(sample, sample.processor, tid);
                 if (sample.status == NVIMGCODEC_PROCESSING_STATUS_SUCCESS) {
-                    sample.processor->elligible_samples_->fetch_add(1);
+                    sample.processor->elligible_samples_.fetch_add(1, std::memory_order_relaxed);
                     // if there's a chance we'd like to fallback, query the next decoder just in case.
                     if (static_cast<int>(sample.processor->sample_count_hint_) < num_samples_ &&
                         sample_idx >= static_cast<int>(sample.processor->sample_count_hint_) && sample.processor->fallback_) {
@@ -723,9 +800,9 @@ class ImageGenericCodec
             // so that we process enough samples to fill each processor (may check a few more)
             for (size_t i = 0; i < num_processors; i++) {
                 auto& processor = processors_[i];
-                t.elligible_samples_snapshot_[&processor] = processor.elligible_samples_->load();
+                t.elligible_samples_snapshot_[&processor] = processor.elligible_samples_.load(std::memory_order_relaxed);
             }
-            ordered_sample_idx = atomic_idx_.fetch_add(1);
+            ordered_sample_idx = atomic_idx_.fetch_add(1, std::memory_order_relaxed);
             if (ordered_sample_idx >= num_samples_) {
                 break;
             }
@@ -763,7 +840,7 @@ class ImageGenericCodec
             NVIMGCODEC_LOG_DEBUG(logger_, "Sample #" << sample.sample_idx << " assigned to " << sample.processor->id_);
             sample.processor->sample_count_++;
         }
-        atomic_idx_.store(0);
+        atomic_idx_.store(0, std::memory_order_relaxed);
     }
 
     ProcessorEntry* initProcessorsAndGetFirstForCodec(const ICodec* codec) {
@@ -778,14 +855,16 @@ class ImageGenericCodec
             NVIMGCODEC_LOG_INFO(logger_, "create " << processor->id_ << " load_hint " << processor->backend_params_.load_hint
                                                    << " load_hint_policy " << processor->backend_params_.load_hint_policy);
             processor->instance_ = Impl::createInstance(processor->factory_, &exec_params_, options_.c_str());
-            if (Impl::hasBatchedAPI(processor->instance_.get()))
+            processor->has_batched_api = Impl::hasBatchedAPI(processor->instance_.get());
+            if (processor->has_batched_api)
                 batched_processors_.insert(processor);
             processor = processor->fallback_;
         }
         return firstProcessor;
     }
 
-    void initState(const std::vector<ICodeStream*>& code_streams, const std::vector<IImage*>& images)
+    void initState(const std::vector<ICodeStream*>& code_streams, const std::vector<IImage*>& images,
+        const void* params)
     {
         int N = images.size();
         assert(static_cast<int>(code_streams.size()) == N);
@@ -799,6 +878,9 @@ class ImageGenericCodec
             samples_.emplace_back(&exec_params_);
         while (static_cast<int>(samples_.size()) > N)
             samples_.pop_back();
+
+        for (auto& sample : samples_)
+            sample.params = params;
 
         assert(code_streams.size() == static_cast<size_t>(num_samples_));
         curr_order_.resize(num_samples_);
@@ -817,14 +899,15 @@ class ImageGenericCodec
         for (auto& processor : processors_) {
             processor.sample_count_hint_ = num_samples_;
             processor.sample_count_ = 0;
-            processor.elligible_samples_ = std::make_unique<std::atomic<size_t>>(0);
+            processor.elligible_samples_.store(0, std::memory_order_relaxed);
         }
     }
 
     void canProcess(const std::vector<ICodeStream*>& code_streams, const std::vector<IImage*>& images,
-        nvimgcodecProcessingStatus_t* processing_status, int force_format)
+        nvimgcodecProcessingStatus_t* processing_status, int force_format, const void* params)
     {
-        initState(code_streams, images);
+        DeviceGuard device_guard(exec_params_.device_id);
+        initState(code_streams, images, params);
         for (int sample_idx : curr_order_) {
             auto& sample = samples_[sample_idx];
             processing_status[sample_idx] = sample.status = NVIMGCODEC_PROCESSING_STATUS_CODEC_UNSUPPORTED;
@@ -834,7 +917,10 @@ class ImageGenericCodec
             while (sample.processor) {
                 sample.status = static_cast<Impl*>(this)->canProcessImpl(sample, sample.processor, 0);
                 bool can_decode_with_other_format_or_params = (static_cast<unsigned int>(sample.status) & 0b11) == 0b01;
-                if (sample.status == NVIMGCODEC_PROCESSING_STATUS_SUCCESS || (!force_format && can_decode_with_other_format_or_params)) {
+                // A corrupted codestream cannot become valid by trying another backend.
+                if (sample.status == NVIMGCODEC_PROCESSING_STATUS_SUCCESS ||
+                    sample.status == NVIMGCODEC_PROCESSING_STATUS_IMAGE_CORRUPTED ||
+                    (!force_format && can_decode_with_other_format_or_params)) {
                     break;
                 }
                 sample.processor = sample.processor->fallback_;
@@ -845,7 +931,7 @@ class ImageGenericCodec
 
     ProcessorEntry* nextParallelProcessor(ProcessorEntry* processor)
     {
-        if (processor && Impl::hasBatchedAPI(processor->instance_.get()))
+        if (processor && processor->has_batched_api)
             return nextParallelProcessor(processor->fallback_);
         else
             return processor;
@@ -855,7 +941,7 @@ class ImageGenericCodec
         auto& sample = samples_[sample_idx];
         if (curr_promise_->isSet(sample_idx))
             return false;
-        else if (Impl::hasBatchedAPI(sample.processor->instance_.get()))
+        else if (sample.processor->has_batched_api)
             return false;
         else
             return true;
@@ -880,7 +966,7 @@ class ImageGenericCodec
                 NVIMGCODEC_LOG_DEBUG(logger_, tid << ": " << processor->id_ << " canProcess #" << sample.sample_idx);
                 assert(processor->instance_);
 
-                assert(!Impl::hasBatchedAPI(processor->instance_.get()));
+                assert(!processor->has_batched_api);
                 sample.status = static_cast<Impl*>(this)->canProcessImpl(sample, sample.processor, tid);
                 failed = (sample.status != NVIMGCODEC_PROCESSING_STATUS_SUCCESS);
                 if (failed)
@@ -910,9 +996,11 @@ class ImageGenericCodec
         NVIMGCODEC_LOG_TRACE(logger_, tid << ": processSample DONE");
     }
 
-    ProcessingResultsPromise::FutureImpl process(const std::vector<ICodeStream*>& code_streams, const std::vector<IImage*>& images)
+    ProcessingResultsPromise::FutureImpl process(const std::vector<ICodeStream*>& code_streams, const std::vector<IImage*>& images,
+        const void* params)
     {
         NVIMGCODEC_LOG_INFO(logger_, Impl::process_name() << " num_samples=" << code_streams.size());
+        DeviceGuard device_guard(exec_params_.device_id);
         auto executor = executor_->getExecutorDesc();
 
         NVIMGCODEC_LOG_TRACE(logger_, "waiting for previous tasks to finish");
@@ -930,7 +1018,7 @@ class ImageGenericCodec
         }
         start_iteration_time_ = std::chrono::high_resolution_clock::now();
 
-        initState(code_streams, images);
+        initState(code_streams, images, params);
 
         assert(curr_promise_);
         auto future = curr_promise_->getFuture();
@@ -939,7 +1027,7 @@ class ImageGenericCodec
 
         adjustBatchSizes(last_iter_duration_main, last_iter_duration);
 
-        atomic_idx_.store(0);
+        atomic_idx_.store(0, std::memory_order_relaxed);
         if (num_samples_ <= 1 || num_threads_ <= 1) {
             PostSyncGuard post_sync_guard(this, 0);  // postSync on scope exit
             cooperativeSetup(0);
@@ -952,12 +1040,13 @@ class ImageGenericCodec
         } else {
             auto setup_task = [](int tid, int sample_idx, void* context) -> void {
                 auto* this_ptr = reinterpret_cast<ImageGenericCodec<Impl, Factory, Processor>*>(context);
+                DeviceGuard device_guard(this_ptr->exec_params_.device_id);
                 PostSyncGuard post_sync_guard(this_ptr, tid);  // postSync on scope exit
                 this_ptr->cooperativeSetup(tid);
                 this_ptr->setup_barrier_.arrive_and_wait();
 
                 int ordered_sample_idx;
-                while ((ordered_sample_idx = this_ptr->atomic_idx_.fetch_add(1)) < this_ptr->num_samples_) {
+                while ((ordered_sample_idx = this_ptr->atomic_idx_.fetch_add(1, std::memory_order_relaxed)) < this_ptr->num_samples_) {
                     int sample_idx = this_ptr->curr_order_[ordered_sample_idx];
                     if (this_ptr->shouldProcessSingleImage(sample_idx))
                         this_ptr->processSample(sample_idx, tid);
@@ -988,7 +1077,7 @@ class ImageGenericCodec
         NVIMGCODEC_LOG_TRACE(logger_, "batched_processors_ size=" << batched_processors_.size());
         for (auto* processor_ptr : batched_processors_) {
             auto& processor = *processor_ptr;
-            assert(processor.instance_ && Impl::hasBatchedAPI(processor.instance_.get()));
+            assert(processor.instance_ && processor.has_batched_api);
             NVIMGCODEC_LOG_DEBUG(logger_, processor.id_ + " start");
             batched_code_stream_descs_.clear();
             batched_image_descs_.clear();
@@ -1012,18 +1101,25 @@ class ImageGenericCodec
             auto ret = static_cast<Impl*>(this)->processBatchImpl(processor);
             size_t fallback_count = 0;
             for (auto* sample : batched_processed_) {
-                if (ret && sample->status == NVIMGCODEC_PROCESSING_STATUS_SUCCESS) {
+                const bool decoded_ok = ret && sample->status == NVIMGCODEC_PROCESSING_STATUS_SUCCESS;
+                // Next single-sample (non-batched) processor in the fallback chain. Batch-only
+                // decoders (decode == nullptr, e.g. the nvjpeg lossless decoder) implement only
+                // decodeBatch and must never be dispatched to the single-sample
+                // processSample()/decode() path, or that NULL decode callback would be called.
+                auto* next_processor = decoded_ok ? nullptr : nextParallelProcessor(sample->processor->fallback_);
+                if (decoded_ok) {
                     NVIMGCODEC_LOG_DEBUG(logger_, processor.id_ << " set success #" << sample->sample_idx);
                     curr_promise_->set(sample->sample_idx, ProcessingResult::success());
-                } else if (!sample->processor->fallback_) {
+                } else if (next_processor == nullptr) {
                     NVIMGCODEC_LOG_INFO(logger_, processor.id_ + " set failure #" << sample->sample_idx << " status=" << sample->status);
                     curr_promise_->set(sample->sample_idx, ProcessingResult::failure(sample->status));
                 } else {
                     NVIMGCODEC_LOG_INFO(
-                        logger_, processor.id_ << " failed #" << sample->sample_idx << ". Trying next: " << processor.fallback_->id_);
-                    sample->processor = sample->processor->fallback_;
+                        logger_, processor.id_ << " failed #" << sample->sample_idx << ". Trying next: " << next_processor->id_);
+                    sample->processor = next_processor;
                     auto parallel_process_task = [](int tid, int sample_idx, void* context) -> void {
                         auto* this_ptr = reinterpret_cast<ImageGenericCodec<Impl, Factory, Processor>*>(context);
+                        DeviceGuard device_guard(this_ptr->exec_params_.device_id);
                         this_ptr->setupSample(sample_idx, tid);
                         assert(this_ptr->shouldProcessSingleImage(sample_idx));
                         this_ptr->processSample(sample_idx, tid);
@@ -1094,7 +1190,7 @@ class ImageGenericCodec
         };
 
         for (auto* processor : batched_processors_) {
-            if (!processor->instance_ || !Impl::hasBatchedAPI(processor->instance_.get()) || !processor->fallback_) {
+            if (!processor->has_batched_api || !processor->fallback_) {
                 processor->sample_count_hint_ = num_samples_;
             } else if (processor->backend_params_.load_hint_policy == NVIMGCODEC_LOAD_HINT_POLICY_ADAPTIVE_MINIMIZE_IDLE_TIME) {
                 if (!adaptive_load_update_done) {

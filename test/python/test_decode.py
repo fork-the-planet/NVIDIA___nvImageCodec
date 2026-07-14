@@ -21,7 +21,7 @@ import pytest as t
 import numpy as np
 try:
     import cupy as cp
-    img = cp.random.randint(0, 255, (100, 100, 3), dtype=cp.uint8) # Force to load necessary libriaries
+    img = cp.random.randint(0, 255, (100, 100, 3), dtype=cp.uint8) # Force to load necessary libraries
     cuda_streams = [None, cp.cuda.Stream(non_blocking=True), cp.cuda.Stream(non_blocking=False)]
     CUPY_AVAILABLE = True
 except:
@@ -32,7 +32,9 @@ except:
 from nvidia import nvimgcodec
 
 from utils import *
-import nvjpeg_test_speedup
+
+# if there are problems detecting nvJPEG version, use the stricter test
+SKIP_NVJPEG_ROI_EDGE_COMPARISON = get_nvjpeg_ver() != (0,0,0) and get_nvjpeg_ver() < NVJPEG_WITH_FIXED_UPSAMPLING_VERSION
 
 backends_hybrid = [nvimgcodec.Backend(nvimgcodec.BackendKind.HYBRID_CPU_GPU)]
 backends_gpu = [nvimgcodec.Backend(nvimgcodec.BackendKind.GPU_ONLY)]
@@ -52,12 +54,8 @@ def expected_buffer_kind(backends):
     return nvimgcodec.ImageBufferKind.STRIDED_HOST
 
 
-def decode_single_image_test(tmp_path, input_img_file, input_format, backends, max_num_cpu_threads):
-    if backends:
-        decoder = nvimgcodec.Decoder(max_num_cpu_threads=max_num_cpu_threads,
-            backends=backends, options=get_default_decoder_options())
-    else:
-        decoder = nvimgcodec.Decoder(options=get_default_decoder_options())
+def decode_single_image_test(input_img_file, input_format, backends, max_num_cpu_threads):
+    decoder = nvimgcodec.Decoder(max_num_cpu_threads=max_num_cpu_threads, backends=backends)
 
     input_img_path = os.path.join(img_dir_path, input_img_file)
 
@@ -115,8 +113,8 @@ def decode_single_image_test(tmp_path, input_img_file, input_format, backends, m
         "jpeg2k/cat-1245673_640-12bit.jp2"
     ]
 )
-def test_decode_single_image_common(tmp_path, input_img_file, input_format, backends, max_num_cpu_threads):
-    decode_single_image_test(tmp_path, input_img_file, input_format, backends, max_num_cpu_threads)
+def test_decode_single_image_common(input_img_file, input_format, backends, max_num_cpu_threads):
+    decode_single_image_test(input_img_file, input_format, backends, max_num_cpu_threads)
 
 
 @t.mark.parametrize("max_num_cpu_threads", [0, 1, 5])
@@ -131,8 +129,8 @@ def test_decode_single_image_common(tmp_path, input_img_file, input_format, back
         "jpeg/cmyk.jpg",
     ]
 )
-def test_decode_single_image_cuda12_only(tmp_path, input_img_file, input_format, backends, max_num_cpu_threads):
-    decode_single_image_test(tmp_path, input_img_file, input_format, backends, max_num_cpu_threads)
+def test_decode_single_image_cuda12_only(input_img_file, input_format, backends, max_num_cpu_threads):
+    decode_single_image_test(input_img_file, input_format, backends, max_num_cpu_threads)
 
 @t.mark.parametrize(
     "input_img_file",
@@ -168,7 +166,7 @@ def test_decode_color_spec(input_img_file, color_spec):
     backends = [nvimgcodec.Backend(nvimgcodec.BackendKind.GPU_ONLY),
                 nvimgcodec.Backend(nvimgcodec.BackendKind.HYBRID_CPU_GPU),
                 nvimgcodec.Backend(nvimgcodec.BackendKind.CPU_ONLY)]
-    decoder = nvimgcodec.Decoder(options=get_default_decoder_options(), backends=backends)
+    decoder = nvimgcodec.Decoder(backends=backends)
     params = nvimgcodec.DecodeParams(
         color_spec=color_spec, allow_any_depth=False, apply_exif_orientation=True)
     test_img = decoder.read(input_img_path, params=params)
@@ -245,16 +243,11 @@ def test_decode_color_spec(input_img_file, color_spec):
         "jpeg2k/cat-1245673_640-12bit.jp2"
     )]
 )
-def test_decode_batch(tmp_path, input_images_batch, input_format, backends, cuda_stream, max_num_cpu_threads):
+def test_decode_batch(input_images_batch, input_format, backends, cuda_stream, max_num_cpu_threads):
     input_images = [os.path.join(img_dir_path, img)
                     for img in input_images_batch]
     ref_images = [get_opencv_reference(img) for img in input_images]
-    if backends:
-        decoder = nvimgcodec.Decoder(
-            max_num_cpu_threads=max_num_cpu_threads, backends=backends, options=get_default_decoder_options())
-    else:
-        decoder = nvimgcodec.Decoder(
-            max_num_cpu_threads=max_num_cpu_threads, options=get_default_decoder_options())
+    decoder = nvimgcodec.Decoder(max_num_cpu_threads=max_num_cpu_threads, backends=backends)
 
     encoded_images = load_batch(input_images, input_format)
 
@@ -276,7 +269,7 @@ def test_decode_batch(tmp_path, input_images_batch, input_format, backends, cuda
 )
 def test_decode_image_check_precision(input_img_file, precision):
     input_img_path = os.path.join(img_dir_path, input_img_file)
-    decoder = nvimgcodec.Decoder(options=get_default_decoder_options())
+    decoder = nvimgcodec.Decoder()
     test_img = decoder.read(input_img_path, params=nvimgcodec.DecodeParams(
         color_spec=nvimgcodec.ColorSpec.UNCHANGED, allow_any_depth=True, apply_exif_orientation=False))
     assert test_img.precision == precision
@@ -314,16 +307,11 @@ def test_decode_buffer_type(backends):
         "jpeg2k/cat-1046544_640.jp2",
      )]
 )
-def test_decode_batch_with_unsupported_formats(tmp_path, input_images_batch, input_format, backends, cuda_stream, max_num_cpu_threads):
+def test_decode_batch_with_unsupported_formats(input_images_batch, input_format, backends, cuda_stream, max_num_cpu_threads):
     input_images = [os.path.join(img_dir_path, img)
                     for img in input_images_batch]
     ref_images = [get_opencv_reference(img) for img in input_images]
-    if backends:
-        decoder = nvimgcodec.Decoder(
-            max_num_cpu_threads=max_num_cpu_threads, backends=backends, options=get_default_decoder_options())
-    else:
-        decoder = nvimgcodec.Decoder(
-            max_num_cpu_threads=max_num_cpu_threads, options=get_default_decoder_options())
+    decoder = nvimgcodec.Decoder(max_num_cpu_threads=max_num_cpu_threads, backends=backends)
 
     encoded_images = load_batch(input_images, input_format)
 
@@ -341,7 +329,7 @@ def test_decode_batch_with_unsupported_formats(tmp_path, input_images_batch, inp
     compare_device_with_host_images(test_images, ref_images)
 
 
-def verify_image_roi(img_roi, ref_img, region, fill_value):
+def verify_image_roi(img_roi, ref_img, region, fill_value, skip_edge_check=False):
     np_roi = np.asarray(img_roi.cpu())
     np_ref = np.asarray(ref_img.cpu())
 
@@ -377,6 +365,10 @@ def verify_image_roi(img_roi, ref_img, region, fill_value):
     else:
         np_ref = np_ref[:end_y]
 
+    if skip_edge_check:
+        np_ref = np_ref[1:-1, 1:-1]
+        np_roi = np_roi[1:-1, 1:-1]
+
     assert np_ref.shape == np_roi.shape
     assert (np_ref == np_roi).all()
 
@@ -393,11 +385,12 @@ def roi_test_impl(decoder, image_path, start_offset_y, start_offset_x, end_offse
     ref_img = decoder.decode(cs, params=params)
     assert ref_img is not None
 
-    verify_image_roi(img_roi, ref_img, roi, fill_value)
+    verify_image_roi(img_roi, ref_img, roi, fill_value, skip_edge_check=SKIP_NVJPEG_ROI_EDGE_COMPARISON and ".jpg" in image_path)
 
 
 @t.mark.parametrize("input_image", [
     "jpeg/padlock-406986_640_410.jpg",
+    "jpeg/padlock-406986_640_420.jpg",  # will fail fancy upsampling on edge with old version of nvjpeg
     "jpeg2k/cat-1046544_640.jp2",       # to test direct decode without conversion
     "jpeg2k/cat-1046544_640-16bit.jp2", # to test decode with convert kernel (as we decode to 8bit)
     "jpeg2k/tiled-cat-1046544_640.jp2", # to test tiled decode
@@ -417,11 +410,14 @@ def roi_test_impl(decoder, image_path, start_offset_y, start_offset_x, end_offse
 @t.mark.parametrize("end_offset_y", [-40, 45])
 @t.mark.parametrize("end_offset_x", [-30, 35])
 def test_decode_roi_cuda(input_image, start_offset_y, start_offset_x, end_offset_y, end_offset_x):
-    decoder = nvimgcodec.Decoder(backends=[nvimgcodec.Backend(nvimgcodec.BackendKind.GPU_ONLY), nvimgcodec.Backend(nvimgcodec.BackendKind.HYBRID_CPU_GPU)])
+    decoder = nvimgcodec.Decoder(
+        backends=[nvimgcodec.Backend(nvimgcodec.BackendKind.GPU_ONLY), nvimgcodec.Backend(nvimgcodec.BackendKind.HYBRID_CPU_GPU)],
+        options=":enable_roi_fancy_upsampling=1"
+    )
     roi_test_impl(decoder, input_image, start_offset_y, start_offset_x, end_offset_y, end_offset_x)
 
 @t.mark.parametrize("input_image", [
-    "jpeg/padlock-406986_640_410.jpg",
+    "jpeg/padlock-406986_640_410.jpg",  # will fail fancy upsampling on edge with old version of nvjpeg
     "jpeg2k/cat-1046544_640.jp2",       # to test direct decode without conversion
     "jpeg2k/cat-1046544_640-16bit.jp2", # to test decode with convert kernel (as we decode to 8bit)
     "jpeg2k/tiled-cat-1046544_640.jp2", # to test tiled decode
@@ -438,14 +434,19 @@ def test_decode_roi_cuda(input_image, start_offset_y, start_offset_x, end_offset
 ])
 @t.mark.parametrize("fill_value", [0, 125, 255])
 def test_decode_roi_cuda_fill_value(input_image, fill_value):
-    decoder = nvimgcodec.Decoder(backends=[nvimgcodec.Backend(nvimgcodec.BackendKind.GPU_ONLY), nvimgcodec.Backend(nvimgcodec.BackendKind.HYBRID_CPU_GPU)])
+    decoder = nvimgcodec.Decoder(
+        backends=[nvimgcodec.Backend(nvimgcodec.BackendKind.GPU_ONLY), nvimgcodec.Backend(nvimgcodec.BackendKind.HYBRID_CPU_GPU)],
+        options=":enable_roi_fancy_upsampling=1"
+    )
     roi_test_impl(decoder, input_image, -50, -40, 60, 55, fill_value)
 
 
-@t.mark.skipif(sys.platform.startswith("win32") and int(os.getenv(("CUDA_VERSION_MAJOR"), 12)) < 12,  reason="temporary while waiting for fix")
 def test_decode_roi_HW():
     try:
-        decoder = nvimgcodec.Decoder(backends=[nvimgcodec.Backend(nvimgcodec.BackendKind.HW_GPU_ONLY)])
+        decoder = nvimgcodec.Decoder(
+            backends=[nvimgcodec.Backend(nvimgcodec.BackendKind.HW_GPU_ONLY)],
+            options=":enable_roi_fancy_upsampling=1"
+        )
     except:
         t.skip("nvJPEG HW decoder not available")
     image_path = os.path.join(img_dir_path, "jpeg/padlock-406986_640_420.jpg")
@@ -471,7 +472,7 @@ def test_decode_roi_HW():
     result = decoder.decode(batch)
     for i, (img, roi) in enumerate(zip(result, regions)):
         assert img is not None
-        verify_image_roi(img, ref_img, roi, batch_elements_fill_values[i % len(batch_elements_fill_values)])
+        verify_image_roi(img, ref_img, roi, batch_elements_fill_values[i % len(batch_elements_fill_values)], skip_edge_check=SKIP_NVJPEG_ROI_EDGE_COMPARISON)
 
 
 @t.mark.parametrize("start_offset_y", [-50, 55])
@@ -487,7 +488,10 @@ def test_decode_roi_HW():
                     ),
                      "tiff/cat-300572_640_palette.tiff"])
 def test_decode_roi_16bit(start_offset_y, start_offset_x, end_offset_y, end_offset_x, fill_value, input_image):
-    decoder = nvimgcodec.Decoder(backends=[nvimgcodec.Backend(nvimgcodec.BackendKind.GPU_ONLY), nvimgcodec.Backend(nvimgcodec.BackendKind.HYBRID_CPU_GPU)])
+    decoder = nvimgcodec.Decoder(
+        backends=[nvimgcodec.Backend(nvimgcodec.BackendKind.GPU_ONLY), nvimgcodec.Backend(nvimgcodec.BackendKind.HYBRID_CPU_GPU)],
+        options=":enable_roi_fancy_upsampling=1"
+    )
     params = nvimgcodec.DecodeParams(allow_any_depth=True)
     roi_test_impl(decoder, input_image, start_offset_y, start_offset_x, end_offset_y, end_offset_x, fill_value, params)
 
@@ -528,7 +532,7 @@ def test_decode_ycc(backends):
     input_img_paths = [os.path.join(img_dir_path, img_file) for img_file in image_batch]
 
     try:
-        decoder = nvimgcodec.Decoder(backends=backends)
+        decoder = nvimgcodec.Decoder(backends=backends, options=":enable_roi_fancy_upsampling=1")
     except:
         t.skip(f"Decoder backends are not supported for this platform: " + ", ".join(map(lambda b: str(b.backend_kind), backends)))
 
@@ -569,7 +573,7 @@ def test_decode_ycc(backends):
 def test_decode_ycc_unsupported(image_path):
     image_path = os.path.join(img_dir_path, image_path)
 
-    decoder = nvimgcodec.Decoder()
+    decoder = nvimgcodec.Decoder(options=":enable_roi_fancy_upsampling=1")
 
     rbg_image = decoder.read(image_path)
     ycc_image = decoder.read(image_path, params=nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.SYCC))
@@ -891,7 +895,7 @@ def decode_to_external_buffer_slice_with_roi_impl(image_path, dtype, backends, b
     image_path = os.path.join(img_dir_path, image_path)
 
     try:
-        decoder = nvimgcodec.Decoder(backends=backends)
+        decoder = nvimgcodec.Decoder(backends=backends, options=":enable_roi_fancy_upsampling=1")
     except:
         t.skip(f"Decoder backends are not supported for this platform: " + ", ".join(map(lambda b: str(b.backend_kind), backends)))
 
@@ -989,7 +993,7 @@ def test_rgb_to_gray_to_rgb_conversion(input_img_file, encode_codec, backends):
         t.skip("nvCOMP is not supported on this platform")
 
     input_img_path = os.path.join(img_dir_path, input_img_file)
-    decoder = nvimgcodec.Decoder(backends=backends, options=get_default_decoder_options())
+    decoder = nvimgcodec.Decoder(backends=backends)
     encoder = nvimgcodec.Encoder(backends=backends)
     
     # Create CodeStream from file

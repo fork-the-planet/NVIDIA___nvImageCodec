@@ -71,7 +71,7 @@ build_per_python_lib(nvimgcodec_python
     OUTPUT_NAME nvimgcodec_impl
     OUTPUT_DIR ${PY_NVIMGCODEC_IMPL_OUTPUT_DIR}
     PUBLIC_LIBS nvimgcodec
-    PRIV_LIBS CUDA::cudart_static ${CUDA_DRIVER_LIB} $<TARGET_OBJECTS:nvimgcodec_imgproc_static>
+    PRIV_LIBS ${CUDA_CUDART_LIB} ${CUDA_DRIVER_LIB} $<TARGET_OBJECTS:nvimgcodec_imgproc_static>
     SRC ${PY_NVIMGCODEC_SRCS})
 
 if(CUDA_VERSION_MAJOR GREATER_EQUAL 13)
@@ -80,14 +80,14 @@ if(CUDA_VERSION_MAJOR GREATER_EQUAL 13)
         'nvjpeg': [ 'nvidia-nvjpeg'],
         'nvjpeg2k': [ 'nvidia-nvjpeg2k-cu${CUDA_VERSION_MAJOR}'],
         'nvtiff': [
-            'nvidia-nvtiff-cu${CUDA_VERSION_MAJOR}',
-            'nvidia-libnvcomp-cu${CUDA_VERSION_MAJOR}'
+            'nvidia-nvtiff-cu${CUDA_VERSION_MAJOR}>=0.8.0',
+            'nvidia-libnvcomp-cu${CUDA_VERSION_MAJOR}>=5,<6'
         ],
         'all': [
             'nvidia-nvjpeg',
             'nvidia-nvjpeg2k-cu${CUDA_VERSION_MAJOR}',
-            'nvidia-nvtiff-cu${CUDA_VERSION_MAJOR}',
-            'nvidia-libnvcomp-cu${CUDA_VERSION_MAJOR}',
+            'nvidia-nvtiff-cu${CUDA_VERSION_MAJOR}>=0.8.0',
+            'nvidia-libnvcomp-cu${CUDA_VERSION_MAJOR}>=5,<6',
         ],
     }")
 else() # CUDA 12 and below
@@ -96,10 +96,10 @@ else() # CUDA 12 and below
     if(SUBSTR_INDEX GREATER -1) # Tegra
         set(EXTRAS_REQUIRE "{
             'nvjpeg2k': [ 'nvidia-nvjpeg2k-tegra-cu12'],
-            'nvtiff': ['nvidia-nvtiff-tegra-cu12'],
+            'nvtiff': ['nvidia-nvtiff-tegra-cu12>=0.8.0'],
             'all': [
                 'nvidia-nvjpeg2k-tegra-cu12',
-                'nvidia-nvtiff-tegra-cu12',
+                'nvidia-nvtiff-tegra-cu12>=0.8.0',
             ],
         }")
     else() # Non-Tegra
@@ -107,14 +107,14 @@ else() # CUDA 12 and below
             'nvjpeg': [ 'nvidia-nvjpeg-cu${CUDA_VERSION_MAJOR}'],
             'nvjpeg2k': [ 'nvidia-nvjpeg2k-cu${CUDA_VERSION_MAJOR}'],
             'nvtiff': [
-                'nvidia-nvtiff-cu${CUDA_VERSION_MAJOR}',
-                'nvidia-libnvcomp-cu${CUDA_VERSION_MAJOR}'
+                'nvidia-nvtiff-cu${CUDA_VERSION_MAJOR}>=0.8.0',
+                'nvidia-libnvcomp-cu${CUDA_VERSION_MAJOR}>=5,<6'
             ],
             'all': [
                 'nvidia-nvjpeg-cu${CUDA_VERSION_MAJOR}',
                 'nvidia-nvjpeg2k-cu${CUDA_VERSION_MAJOR}',
-                'nvidia-nvtiff-cu${CUDA_VERSION_MAJOR}',
-                'nvidia-libnvcomp-cu${CUDA_VERSION_MAJOR}',
+                'nvidia-nvtiff-cu${CUDA_VERSION_MAJOR}>=0.8.0',
+                'nvidia-libnvcomp-cu${CUDA_VERSION_MAJOR}>=5,<6',
             ],
         }")
     endif()
@@ -183,6 +183,14 @@ if(NVIMGCODEC_COPY_LIBS_TO_PYTHON_DIR)
                     for /r \"${PROJECT_BINARY_DIR}\\extensions\" %%d in (.) do for %%f in (\"%%d\\$<CONFIG>\\*.dll\") do xcopy \"%%f\" \"${CMAKE_CURRENT_BINARY_DIR}\\nvidia\\nvimgcodec\\extensions\\\" /Y &&
                     xcopy "${PROJECT_SOURCE_DIR}\\include\\*.*" "${CMAKE_CURRENT_BINARY_DIR}\\nvidia\\nvimgcodec\\include\\" /S /Y
         )
+        if(NVIMGCODEC_OPENCV_RUNTIME_DLLS)
+            add_custom_command(
+                TARGET copy_libs_to_python_dir
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${NVIMGCODEC_OPENCV_RUNTIME_DLLS}
+                    "${CMAKE_CURRENT_BINARY_DIR}\\nvidia\\nvimgcodec\\extensions"
+            )
+        endif()
         endif()
 
 endif(NVIMGCODEC_COPY_LIBS_TO_PYTHON_DIR)

@@ -50,37 +50,37 @@ class OpenCVExtDecoderTest : public CommonExtDecoderTestWithPathAndFormat
         nvimgcodecExtensionDesc_t jpeg_parser_extension_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
         ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_jpeg_parser_extension_desc(&jpeg_parser_extension_desc));
         extensions_.emplace_back();
-        nvimgcodecExtensionCreate(instance_, &extensions_.back(), &jpeg_parser_extension_desc);
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &jpeg_parser_extension_desc));
 
         nvimgcodecExtensionDesc_t jpeg2k_parser_extension_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
         ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_jpeg2k_parser_extension_desc(&jpeg2k_parser_extension_desc));
         extensions_.emplace_back();
-        nvimgcodecExtensionCreate(instance_, &extensions_.back(), &jpeg2k_parser_extension_desc);
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &jpeg2k_parser_extension_desc));
 
         nvimgcodecExtensionDesc_t png_parser_extension_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
         ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_png_parser_extension_desc(&png_parser_extension_desc));
         extensions_.emplace_back();
-        nvimgcodecExtensionCreate(instance_, &extensions_.back(), &png_parser_extension_desc);
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &png_parser_extension_desc));
 
         nvimgcodecExtensionDesc_t bmp_parser_extension_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
         ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_bmp_parser_extension_desc(&bmp_parser_extension_desc));
         extensions_.emplace_back();
-        nvimgcodecExtensionCreate(instance_, &extensions_.back(), &bmp_parser_extension_desc);
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &bmp_parser_extension_desc));
 
         nvimgcodecExtensionDesc_t pnm_parser_extension_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
         ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_pnm_parser_extension_desc(&pnm_parser_extension_desc));
         extensions_.emplace_back();
-        nvimgcodecExtensionCreate(instance_, &extensions_.back(), &pnm_parser_extension_desc);
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &pnm_parser_extension_desc));
 
         nvimgcodecExtensionDesc_t tiff_parser_extension_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
         ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_tiff_parser_extension_desc(&tiff_parser_extension_desc));
         extensions_.emplace_back();
-        nvimgcodecExtensionCreate(instance_, &extensions_.back(), &tiff_parser_extension_desc);
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &tiff_parser_extension_desc));
 
         nvimgcodecExtensionDesc_t webp_parser_extension_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
         ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_webp_parser_extension_desc(&webp_parser_extension_desc));
         extensions_.emplace_back();
-        nvimgcodecExtensionCreate(instance_, &extensions_.back(), &webp_parser_extension_desc);
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &webp_parser_extension_desc));
 
         nvimgcodecExtensionDesc_t opencv_extension_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
         ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_opencv_extension_desc(&opencv_extension_desc));
@@ -99,10 +99,7 @@ class OpenCVExtDecoderTest : public CommonExtDecoderTestWithPathAndFormat
     }
 };
 
-TEST_P(OpenCVExtDecoderTest, SingleImage)
-{
-    TestSingleImage(image_path, sample_format);
-}
+DEFINE_SINGLE_IMAGE_STRIDE_TESTS(OpenCVExtDecoderTest)
 
 INSTANTIATE_TEST_SUITE_P(OPENCV_DECODE_JPEG_I_RGB,
     OpenCVExtDecoderTest,
@@ -188,6 +185,40 @@ INSTANTIATE_TEST_SUITE_P(OPENCV_DECODE_JPEG_ROI,
     OpenCVExtDecoderTestRegion,
     Values(
         std::tuple{"jpeg/padlock-406986_640_422.jpg", NVIMGCODEC_SAMPLEFORMAT_I_RGB}
+    )
+);
+
+// Higher-precision (uint16) reference decode tests for the OpenCV PNG decoder.
+class OpenCVExtDecoderTestHighPrec : public CommonExtDecoderTestWithPathFormatAndType
+{
+  public:
+    void SetUp() override
+    {
+        CommonExtDecoderTestWithPathFormatAndType::SetUp();
+
+        nvimgcodecExtensionDesc_t png_parser_extension_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_png_parser_extension_desc(&png_parser_extension_desc));
+        extensions_.emplace_back();
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &png_parser_extension_desc));
+
+        nvimgcodecExtensionDesc_t opencv_extension_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_opencv_extension_desc(&opencv_extension_desc));
+        extensions_.emplace_back();
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &opencv_extension_desc));
+
+        CommonExtDecoderTestWithPathFormatAndType::CreateDecoder();
+    }
+};
+
+DEFINE_SINGLE_IMAGE_HIGHPREC_STRIDE_TESTS(OpenCVExtDecoderTestHighPrec)
+
+INSTANTIATE_TEST_SUITE_P(OPENCV_DECODE_HIGHPREC_UINT16,
+    OpenCVExtDecoderTestHighPrec,
+    Combine(
+        Values("png/with_alpha_16bit/4ch16bpp.png"),
+        Values(NVIMGCODEC_SAMPLEFORMAT_I_RGB, NVIMGCODEC_SAMPLEFORMAT_I_BGR,
+               NVIMGCODEC_SAMPLEFORMAT_P_RGB, NVIMGCODEC_SAMPLEFORMAT_P_BGR),
+        Values(NVIMGCODEC_SAMPLE_DATA_TYPE_UINT16)
     )
 );
 

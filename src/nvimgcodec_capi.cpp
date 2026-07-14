@@ -21,6 +21,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "code_stream.h"
 #include "codec_registry.h"
@@ -77,6 +78,35 @@ __inline__ nvimgcodecStatus_t getCAPICode(Status status)
         break;
     }
     return code;
+}
+
+static nvimgcodecStatus_t validateCodeStreamViewSelection(const nvimgcodecCodeStreamView_t* code_stream_view, const char* context)
+{
+    if (code_stream_view && code_stream_view->bitstream_offset != 0 && code_stream_view->image_idx != 0) {
+        NVIMGCODEC_LOG_ERROR(
+            Logger::get_default(), "image_idx cannot be combined with bitstream_offset for " << context);
+        return NVIMGCODEC_STATUS_INVALID_PARAMETER;
+    }
+    return NVIMGCODEC_STATUS_SUCCESS;
+}
+
+static nvimgcodecStatus_t validateCodeStreamCreationView(const nvimgcodecCodeStreamView_t* code_stream_view)
+{
+    auto status = validateCodeStreamViewSelection(code_stream_view, "code stream creation views");
+    if (status != NVIMGCODEC_STATUS_SUCCESS || !code_stream_view) {
+        return status;
+    }
+    if (code_stream_view->image_idx != 0) {
+        NVIMGCODEC_LOG_ERROR(
+            Logger::get_default(), "image_idx is not supported for code stream creation views; use sub-code streams");
+        return NVIMGCODEC_STATUS_INVALID_PARAMETER;
+    }
+    if (code_stream_view->region.ndim != 0) {
+        NVIMGCODEC_LOG_ERROR(
+            Logger::get_default(), "region is not supported for code stream creation views; use sub-code streams");
+        return NVIMGCODEC_STATUS_INVALID_PARAMETER;
+    }
+    return NVIMGCODEC_STATUS_SUCCESS;
 }
 
 #ifndef NDEBUG
@@ -344,6 +374,11 @@ nvimgcodecStatus_t nvimgcodecCodeStreamCreateFromFile(
     nvimgcodecInstance_t instance, nvimgcodecCodeStream_t* code_stream, const char* file_name,
     const nvimgcodecCodeStreamView_t* code_stream_view)
 {
+    nvimgcodecStatus_t view_status = validateCodeStreamCreationView(code_stream_view);
+    if (view_status != NVIMGCODEC_STATUS_SUCCESS) {
+        return view_status;
+    }
+    const bool created_code_stream = (code_stream != nullptr && *code_stream == nullptr);
     nvimgcodecStatus_t ret = nvimgcodecStreamCreate(instance, code_stream);
     if (ret != NVIMGCODEC_STATUS_SUCCESS) {
         return ret;
@@ -356,6 +391,24 @@ nvimgcodecStatus_t nvimgcodecCodeStreamCreateFromFile(
                 (*code_stream)->code_stream_.setCodeStreamView(code_stream_view);
             }
             (*code_stream)->code_stream_.parseFromFile(std::string(file_name));
+
+            // Eagerly resolve a creation-time bitstream_offset so an invalid offset fails
+            // here rather than at first decode. Parses only the selected IFD; root
+            // (offset-less) streams stay lazy.
+            if (code_stream_view && code_stream_view->bitstream_offset != 0) {
+                nvimgcodecCodeStreamInfo_t codestream_info{
+                    NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_INFO, sizeof(nvimgcodecCodeStreamInfo_t), nullptr};
+                ret = (*code_stream)->code_stream_.getCodeStreamInfo(&codestream_info);
+                if (ret != NVIMGCODEC_STATUS_SUCCESS) {
+                    // Don't leak the stream we just created; match the contract that
+                    // *code_stream is null/unchanged on failure.
+                    if (created_code_stream) {
+                        delete *code_stream;
+                        *code_stream = nullptr;
+                    }
+                    return ret;
+                }
+            }
         }
     NVIMGCODECAPI_CATCH(ret)
 
@@ -366,6 +419,11 @@ nvimgcodecStatus_t nvimgcodecCodeStreamCreateFromHostMem(
     nvimgcodecInstance_t instance, nvimgcodecCodeStream_t* code_stream, const unsigned char* data, size_t length,
     const nvimgcodecCodeStreamView_t* code_stream_view)
 {
+    nvimgcodecStatus_t view_status = validateCodeStreamCreationView(code_stream_view);
+    if (view_status != NVIMGCODEC_STATUS_SUCCESS) {
+        return view_status;
+    }
+    const bool created_code_stream = (code_stream != nullptr && *code_stream == nullptr);
     nvimgcodecStatus_t ret = nvimgcodecStreamCreate(instance, code_stream);
     if (ret != NVIMGCODEC_STATUS_SUCCESS) {
         return ret;
@@ -378,6 +436,24 @@ nvimgcodecStatus_t nvimgcodecCodeStreamCreateFromHostMem(
                 (*code_stream)->code_stream_.setCodeStreamView(code_stream_view);
             }
             (*code_stream)->code_stream_.parseFromMem(data, length);
+
+            // Eagerly resolve a creation-time bitstream_offset so an invalid offset fails
+            // here rather than at first decode. Parses only the selected IFD; root
+            // (offset-less) streams stay lazy.
+            if (code_stream_view && code_stream_view->bitstream_offset != 0) {
+                nvimgcodecCodeStreamInfo_t codestream_info{
+                    NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_INFO, sizeof(nvimgcodecCodeStreamInfo_t), nullptr};
+                ret = (*code_stream)->code_stream_.getCodeStreamInfo(&codestream_info);
+                if (ret != NVIMGCODEC_STATUS_SUCCESS) {
+                    // Don't leak the stream we just created; match the contract that
+                    // *code_stream is null/unchanged on failure.
+                    if (created_code_stream) {
+                        delete *code_stream;
+                        *code_stream = nullptr;
+                    }
+                    return ret;
+                }
+            }
         }
 
     NVIMGCODECAPI_CATCH(ret)
@@ -443,41 +519,35 @@ nvimgcodecStatus_t nvimgcodecCodeStreamGetSubCodeStream(nvimgcodecCodeStream_t c
     nvimgcodecCodeStream_t* sub_code_stream, const nvimgcodecCodeStreamView_t* code_stream_view)
 {
     nvimgcodecStatus_t ret = NVIMGCODEC_STATUS_SUCCESS;
-    bool create_new_sub_code_stream = false;
     NVIMGCODECAPI_TRY
         {
             CHECK_NULL(code_stream);
             CHECK_NULL(sub_code_stream);
-            create_new_sub_code_stream = *sub_code_stream == nullptr;
             CHECK_NULL_AND_STRUCT(code_stream_view, NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_VIEW, nvimgcodecCodeStreamView_t);
 
-            nvimgcodecCodeStreamInfo_t codestream_info{NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_INFO, sizeof(nvimgcodecCodeStreamInfo_t), nullptr};
-            ret = code_stream->code_stream_.getCodeStreamInfo(&codestream_info);
-
+            ret = validateCodeStreamViewSelection(code_stream_view, "code stream views");
             if (ret != NVIMGCODEC_STATUS_SUCCESS) {
                 return ret;
             }
 
-            if (code_stream_view->image_idx >= codestream_info.num_images){
-                auto logger = &code_stream->nvimgcodec_instance_->director_.logger_;
-                NVIMGCODEC_LOG_ERROR(logger, "Image index #" << code_stream_view->image_idx 
-                    << " out of range (0, "<< codestream_info.num_images << ")");
-                return NVIMGCODEC_STATUS_INVALID_PARAMETER;
+            nvimgcodecCodeStream candidate(code_stream, *code_stream_view);
+            if (code_stream_view->image_idx != 0 || code_stream_view->bitstream_offset != 0) {
+                nvimgcodecCodeStreamInfo_t codestream_info{
+                    NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_INFO, sizeof(nvimgcodecCodeStreamInfo_t), nullptr};
+                ret = candidate.code_stream_.getCodeStreamInfo(&codestream_info);
+                if (ret != NVIMGCODEC_STATUS_SUCCESS) {
+                    return ret;
+                }
             }
 
-            if (create_new_sub_code_stream) {
-                *sub_code_stream = new nvimgcodecCodeStream(code_stream, *code_stream_view);
+            if (*sub_code_stream == nullptr) {
+                *sub_code_stream = new nvimgcodecCodeStream(std::move(candidate));
             } else {
                 NVIMGCODEC_LOG_DEBUG(Logger::get_default(), "*sub_code_stream is non-null, reusing it.");
-                **sub_code_stream = nvimgcodecCodeStream(code_stream, *code_stream_view);
+                **sub_code_stream = std::move(candidate);
             }
         }
     NVIMGCODECAPI_CATCH(ret)
-    if (ret != NVIMGCODEC_STATUS_SUCCESS) {
-        if (*sub_code_stream && create_new_sub_code_stream) {
-            delete *sub_code_stream;
-        }
-    }
     return ret;
 }
 

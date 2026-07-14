@@ -30,8 +30,8 @@ Tests include:
 Test Modes:
 - FAST (default): Runs on 9 hardcoded representative series covering all 8 modalities
   (CR, CT, DX, MG, MR, PT, SR, US) with diverse image counts. Good for regular development.
-- SLOW: Runs on the complete MIDI-B dataset (1400+ series). Use for comprehensive
-  validation before releases.
+- SLOW: Runs on the committed complete MIDI-B dataset manifest (1400+ series).
+  Use for comprehensive validation before releases.
 
 Usage:
   # Run fast subset (default - 9 series)
@@ -47,7 +47,6 @@ Usage:
   pytest test_compress_midi_b_dataset.py -m "slow" -n 8
 """
 
-import sys
 import tempfile
 from pathlib import Path
 import zipfile
@@ -86,6 +85,24 @@ FAST_TEST_SERIES_UIDS = [
 ]
 
 
+def _load_full_test_series_uids():
+    uid_file = Path(__file__).with_name("midi_b_series_uids.txt")
+    uids = tuple(
+        line.strip()
+        for line in uid_file.read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    )
+    duplicate_count = len(uids) - len(set(uids))
+    if duplicate_count:
+        raise RuntimeError(f"{uid_file} contains {duplicate_count} duplicate series UIDs")
+    if not uids:
+        raise RuntimeError(f"{uid_file} does not contain any series UIDs")
+    return uids
+
+
+FULL_TEST_SERIES_UIDS = _load_full_test_series_uids()
+
+
 def _get_midi_b_series_for_testing(use_full_dataset=False):
     """
     Get list of MIDI-B series UIDs for parametrized testing.
@@ -96,44 +113,8 @@ def _get_midi_b_series_for_testing(use_full_dataset=False):
     Returns:
         List of (series_uid, series_info_dict) tuples for testing
     """
-    # Test file is now at test/python/integration/dicom/
-    try:
-        from .download_midi_b_data import get_all_series
-        print("[Collection] Fetching MIDI-B series list...")
-        all_series = get_all_series()
-        
-        if not all_series:
-            print("[Collection] No series found")
-            pytest.fail("No MIDI-B series available for testing")
-        
-        print(f"[Collection] Found {len(all_series)} total series")
-        
-        # Build a lookup dictionary for fast access
-        series_by_uid = {s.get('SeriesInstanceUID'): s for s in all_series if s.get('SeriesInstanceUID')}
-        
-        # Select subset or use all based on parameter
-        if use_full_dataset:
-            selected_series = all_series
-            print(f"[Collection] Using all {len(selected_series)} series (slow mode)")
-        else:
-            # Use hardcoded list of representative series
-            selected_series = []
-            for uid in FAST_TEST_SERIES_UIDS:
-                if uid in series_by_uid:
-                    selected_series.append(series_by_uid[uid])
-                else:
-                    raise ValueError(f"[Collection] Warning: Hardcoded series UID not found: {uid}")
-            print(f"[Collection] Using {len(selected_series)} hardcoded representative series (fast mode)")
-        
-        # Return tuples of (series_uid, series_dict) for parametrization
-        result = [(s.get('SeriesInstanceUID'), s) for s in selected_series if s.get('SeriesInstanceUID')]
-        print(f"[Collection] Parametrizing with {len(result)} series")
-        return result
-    except Exception as e:
-        print(f"[Collection] Could not get MIDI-B series list: {e}")
-        import traceback
-        traceback.print_exc()
-        pytest.fail(f"Failed to fetch MIDI-B series list: {e}")
+    series_uids = FULL_TEST_SERIES_UIDS if use_full_dataset else FAST_TEST_SERIES_UIDS
+    return [(uid, None) for uid in series_uids]
 
 
 def _ensure_series_downloaded(series_uid: str, midi_b_data_dir: Path) -> None:
@@ -567,8 +548,8 @@ class TestMIDIBDataset:
 # We provide two versions: a fast subset (default) and full dataset (slow)
 
 @pytest.mark.integration
-@pytest.mark.parametrize("series_uid,series_info", _get_midi_b_series_for_testing(use_full_dataset=False))
-def test_midi_b_series_representative_subset(series_uid, series_info):
+@pytest.mark.parametrize("series_uid", FAST_TEST_SERIES_UIDS)
+def test_midi_b_series_representative_subset(series_uid):
     """
     Parametrized pytest test for representative subset of MIDI-B series.
     
@@ -582,22 +563,21 @@ def test_midi_b_series_representative_subset(series_uid, series_info):
     
     Args:
         series_uid: SeriesInstanceUID to test
-        series_info: Dictionary with series metadata from TCIA
     """
     if series_uid is None:
         pytest.fail("No MIDI-B series available")
     
     # Create a test case instance to use its helper method
     test_case = TestMIDIBDataset()
-    test_case._test_single_series(series_uid, series_info)
+    test_case._test_single_series(series_uid, None)
 
 
 @pytest.mark.slow
 @pytest.mark.integration
-@pytest.mark.parametrize("series_uid,series_info", _get_midi_b_series_for_testing(use_full_dataset=True))
-def test_midi_b_series_full_dataset(series_uid, series_info):
+@pytest.mark.parametrize("series_uid", FULL_TEST_SERIES_UIDS)
+def test_midi_b_series_full_dataset(series_uid):
     """
-    Parametrized pytest test for ALL MIDI-B series (slow, comprehensive testing).
+    Pytest test for ALL MIDI-B series (slow, comprehensive testing).
     
     This test runs on the complete MIDI-B dataset. It's marked as 'slow' and should
     be run in CI/CD or before major releases to ensure comprehensive coverage.
@@ -605,16 +585,15 @@ def test_midi_b_series_full_dataset(series_uid, series_info):
     To run only this comprehensive test: pytest -m "slow"
     To skip slow tests (default): pytest -m "not slow"
     
-    Args:
-        series_uid: SeriesInstanceUID to test
-        series_info: Dictionary with series metadata from TCIA
+    The series manifest is committed so pytest collection remains deterministic
+    and each series stays independently schedulable under pytest-xdist.
     """
     if series_uid is None:
         pytest.fail("No MIDI-B series available")
-    
+
     # Create a test case instance to use its helper method
     test_case = TestMIDIBDataset()
-    test_case._test_single_series(series_uid, series_info)
+    test_case._test_single_series(series_uid, None)
 
 
 if __name__ == "__main__":
@@ -657,23 +636,9 @@ if __name__ == "__main__":
     elif args.series_uid:
         # Run specific series test
         print(f"Running test for series: {args.series_uid}")
-        
-        # Get all series info (need full list to find the specific one)
-        all_series = _get_midi_b_series_for_testing(use_full_dataset=True)
-        
-        # Find the specific series
-        series_info = None
-        for uid, info in all_series:
-            if uid == args.series_uid:
-                series_info = info
-                break
-        
-        if series_info is None:
-            print(f"ERROR: Series UID not found: {args.series_uid}")
-            sys.exit(1)
-        
+
         # Run the test
-        test_case._test_single_series(args.series_uid, series_info)
+        test_case._test_single_series(args.series_uid, None)
         
         print("\n" + "="*70)
         print("✅ TEST COMPLETED SUCCESSFULLY")

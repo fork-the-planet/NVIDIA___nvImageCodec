@@ -28,6 +28,7 @@
 
 #include "nvimgcodec_tests.h"
 #include "nvjpeg_ext_test_common.h"
+#include "common_ext_encoder_test.h"
 
 using ::testing::Bool;
 using ::testing::Combine;
@@ -473,5 +474,46 @@ INSTANTIATE_TEST_SUITE_P(NVJPEG_ENCODE_INVALID_QUALITY_TYPES, NvJpegExtEncoderTe
 );
 
 // clang-format on
+
+// ---------------------------------------------------------------------------
+// Strided encode->decode round-trip via the shared CommonExtEncoderTest harness.
+// One test case per input plane-stride layout, exercising the strided host->
+// device input copy feeding the nvJPEG encoder. JPEG is lossy, so the round-trip
+// is compared with tolerance (a gross stride misread would still be caught).
+// ---------------------------------------------------------------------------
+class NvJpegExtEncodeDecodeStrideTest :
+    public CommonExtEncoderTest,
+    public ::testing::TestWithParam<nvimgcodecSampleFormat_t>
+{
+  public:
+    void SetUp() override
+    {
+        CommonExtEncoderTest::SetUp();
+
+        nvimgcodecExtensionDesc_t jpeg_parser_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_jpeg_parser_extension_desc(&jpeg_parser_desc));
+        extensions_.emplace_back();
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &jpeg_parser_desc));
+
+        nvimgcodecExtensionDesc_t nvjpeg_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_nvjpeg_extension_desc(&nvjpeg_desc));
+        extensions_.emplace_back();
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &nvjpeg_desc));
+
+        color_spec_ = NVIMGCODEC_COLORSPEC_SRGB;
+        sample_format_ = GetParam();
+        chroma_subsampling_ = NVIMGCODEC_SAMPLING_444;
+        jpeg_encoding_ = NVIMGCODEC_JPEG_ENCODING_BASELINE_DCT;
+
+        CommonExtEncoderTest::CreateDecoderAndEncoder();
+    }
+
+    void TearDown() override { CommonExtEncoderTest::TearDown(); }
+};
+
+DEFINE_ENCODE_DECODE_STRIDE_TESTS_FOR_CODEC(NvJpegExtEncodeDecodeStrideTest, "jpeg", false)
+
+INSTANTIATE_TEST_SUITE_P(NVJPEG_ENCODE_DECODE_STRIDED, NvJpegExtEncodeDecodeStrideTest,
+    ::testing::Values(NVIMGCODEC_SAMPLEFORMAT_I_RGB, NVIMGCODEC_SAMPLEFORMAT_P_RGB));
 
 }} // namespace nvimgcodec::test
