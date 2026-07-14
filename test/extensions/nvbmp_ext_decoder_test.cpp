@@ -55,10 +55,7 @@ class NvbmpExtDecoderTest : public CommonExtDecoderTestWithPathAndFormat
     }
 };
 
-TEST_P(NvbmpExtDecoderTest, SingleImage)
-{
-    TestSingleImage(image_path, sample_format);
-}
+DEFINE_SINGLE_IMAGE_STRIDE_TESTS(NvbmpExtDecoderTest)
 
 INSTANTIATE_TEST_SUITE_P(NVBMP_DECODE,
     NvbmpExtDecoderTest,

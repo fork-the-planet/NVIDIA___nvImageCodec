@@ -25,9 +25,11 @@
 #include <setjmp.h>
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
+#include "imgproc/safe_arithmetic.h"
 #include "jpeg_handle.h"
 #include "log.h"
 
@@ -260,8 +262,25 @@ std::unique_ptr<uint8_t[]> UncompressLow(const void* srcdata, FewerArgsForCompil
             throw std::runtime_error("Unexpected skipped scan lines");
     }
 
-    // check for compatible stride
-    const int min_stride = target_output_width * components * sizeof(JSAMPLE);
+    // Compute min_stride (= W * C * sizeof(JSAMPLE)) and total element count
+    // (= W * H * C) in size_t with explicit overflow checks. The earlier
+    // `total_size >= (1LL << 29)` cap already bounds these products in practice,
+    // but doing the multiplications in narrow int/JDIMENSION made that hard to
+    // see locally; checked size_t arithmetic makes the absence of overflow
+    // self-evident at the use sites below.
+    size_t min_stride_sz = 0;
+    if (!nvimgcodec::SafeMul3SizeT(target_output_width, components, sizeof(JSAMPLE), min_stride_sz)) {
+        std::stringstream ss{};
+        ss << "Overflow computing min_stride from width=" << target_output_width
+           << ", components=" << components << ", elem_size=" << sizeof(JSAMPLE);
+        throw std::runtime_error(ss.str());
+    }
+    if (min_stride_sz > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        std::stringstream ss{};
+        ss << "min_stride " << min_stride_sz << " exceeds int range";
+        throw std::runtime_error(ss.str());
+    }
+    const int min_stride = static_cast<int>(min_stride_sz);
     if (stride == 0) {
         stride = min_stride;
     } else if (stride < min_stride) {
@@ -274,8 +293,15 @@ std::unique_ptr<uint8_t[]> UncompressLow(const void* srcdata, FewerArgsForCompil
     argball->height_ = target_output_height;
     argball->stride_ = stride;
 
+    size_t dst_element_count = 0;
+    if (!nvimgcodec::SafeMul3SizeT(target_output_width, target_output_height, components, dst_element_count)) {
+        std::stringstream ss{};
+        ss << "Overflow computing destination buffer element count from width="
+           << target_output_width << ", height=" << target_output_height << ", components=" << components;
+        throw std::runtime_error(ss.str());
+    }
     std::unique_ptr<uint8_t[]> dstdata;
-    dstdata.reset(new JSAMPLE[target_output_width * target_output_height * components]);
+    dstdata.reset(new JSAMPLE[dst_element_count]);
 
     if (dstdata == nullptr) {
         return nullptr;

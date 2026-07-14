@@ -743,7 +743,7 @@ def fix_malformed_dicom(ds: pydicom.Dataset) -> None:
     1. **DateTime conversion** (DA/TM VRs per PS3.5 Table 6.2-1):
        - Validates format: "YYYYMMDD" (DA) and "HHMMSS.FFFFFF" (TM)
        - Converts to Python date/time objects (required for highdicom compatibility)
-       - Invalid values → empty string (unknown/not applicable)
+       - Invalid or empty values → attribute removed
        
     2. **PatientSex normalization** (0010,0040, Type 2):
        - Enumerated values: "M", "F", "O"

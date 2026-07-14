@@ -17,14 +17,18 @@
 
 #include <nvimgcodec.h>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include <nvtx3/nvtx3.hpp>
 
+#include "imgproc/safe_arithmetic.h"
+
 #include "error_handling.h"
 #include "log.h"
 #include "encoder.h"
+#include "imgproc/image_info_checks.h"
 
 namespace nvbmp {
 
@@ -35,11 +39,16 @@ int writeBMP(const nvimgcodecFrameworkDesc_t* framework, const char* plugin_id, 
 
     unsigned int headers[13];
     int extrabytes;
-    int paddedsize;
     int x;
     int y;
     int n;
     int red, green, blue;
+
+    if (width <= 0 || height <= 0) {
+        NVIMGCODEC_LOG_ERROR(framework, plugin_id, "BMP encoder requires positive width and height, got width="
+            << width << ", height=" << height);
+        return 1;
+    }
 
     extrabytes = 4 - ((width * 3) % 4); // How many bytes of padding to add to each
     // horizontal line - the size of which must
@@ -47,7 +56,31 @@ int writeBMP(const nvimgcodecFrameworkDesc_t* framework, const char* plugin_id, 
     if (extrabytes == 4)
         extrabytes = 0;
 
-    paddedsize = ((width * 3) + extrabytes) * height;
+    // Compute padded pixel-data size in size_t with overflow checks; the
+    // previous `int` multiply could wrap on large dimensions and produce a
+    // bogus size for both the BMP header (`bfSize` / `biSizeImage`) and the
+    // io_stream `reserve()` hint below.
+    size_t row_bytes_sz = 0;
+    if (!nvimgcodec::SafeMulSizeT(static_cast<size_t>(width), 3u, row_bytes_sz)) {
+        NVIMGCODEC_LOG_ERROR(framework, plugin_id, "Overflow computing BMP row bytes from width=" << width);
+        return 1;
+    }
+    row_bytes_sz += static_cast<size_t>(extrabytes);
+    size_t paddedsize_sz = 0;
+    if (!nvimgcodec::SafeMulSizeT(row_bytes_sz, static_cast<size_t>(height), paddedsize_sz)) {
+        NVIMGCODEC_LOG_ERROR(framework, plugin_id, "Overflow computing BMP paddedsize from width="
+            << width << ", height=" << height);
+        return 1;
+    }
+    // BMP `bfSize` and `biSizeImage` header fields are uint32. Reject larger
+    // images rather than silently truncating into the header.
+    // Parens around `max` suppress the Windows <windows.h> max() macro.
+    if (paddedsize_sz > (std::numeric_limits<uint32_t>::max)() - 54u) {
+        NVIMGCODEC_LOG_ERROR(framework, plugin_id, "BMP image size " << paddedsize_sz
+            << " exceeds the 4 GiB limit imposed by the BMP file format");
+        return 1;
+    }
+    const uint32_t paddedsize = static_cast<uint32_t>(paddedsize_sz);
 
     headers[0] = paddedsize + 54; // bfSize (whole file size)
     headers[1] = 0;               // bfReserved (both)
@@ -269,6 +302,10 @@ nvimgcodecProcessingStatus_t EncoderImpl::canEncode(const nvimgcodecCodeStreamDe
             status |= NVIMGCODEC_PROCESSING_STATUS_NUM_PLANES_UNSUPPORTED;
         }
 
+        if (!nvimgcodec::check_planes_consistency(framework_, plugin_id_, image_info)) {
+            status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
+        }
+
         for (uint32_t p = 0; p < image_info.num_planes; ++p) {
             if (image_info.plane_info[p].sample_type != NVIMGCODEC_SAMPLE_DATA_TYPE_UINT8) {
                 status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
@@ -363,6 +400,8 @@ nvimgcodecStatus_t EncoderImpl::encode(const nvimgcodecCodeStreamDesc_t* code_st
             return ret;
         }
 
+        nvimgcodec::warn_if_custom_precision_unsupported(framework_, plugin_id_, image_info);
+
         unsigned char* host_buffer = reinterpret_cast<unsigned char*>(image_info.buffer);
 
         if (NVIMGCODEC_SAMPLEFORMAT_I_RGB == image_info.sample_format) {
@@ -370,11 +409,19 @@ nvimgcodecStatus_t EncoderImpl::encode(const nvimgcodecCodeStreamDesc_t* code_st
                 image_info.plane_info[0].row_stride, NULL, 0, NULL, 0, image_info.plane_info[0].width, image_info.plane_info[0].height, 8,
                 true);
         } else {
-            writeBMP<unsigned char>(framework_, plugin_id_, code_stream->io_stream, host_buffer, image_info.plane_info[0].row_stride,
-                host_buffer + image_info.plane_info[0].row_stride * image_info.plane_info[0].height, image_info.plane_info[1].row_stride,
-                host_buffer + +image_info.plane_info[0].row_stride * image_info.plane_info[0].height +
-                    image_info.plane_info[1].row_stride * image_info.plane_info[0].height,
-                image_info.plane_info[2].row_stride, image_info.plane_info[0].width, image_info.plane_info[0].height, 8, true);
+            // Plane offsets are the running sum of plane_info[i].row_stride *
+            // plane_info[i].height per the C image_info contract, which
+            // keeps the offsets correct even if a plane has its own height
+            // (e.g. chroma-subsampled YUV).
+            const size_t plane0_size = static_cast<size_t>(image_info.plane_info[0].row_stride) *
+                                       image_info.plane_info[0].height;
+            const size_t plane1_size = static_cast<size_t>(image_info.plane_info[1].row_stride) *
+                                       image_info.plane_info[1].height;
+            writeBMP<unsigned char>(framework_, plugin_id_, code_stream->io_stream, host_buffer,
+                image_info.plane_info[0].row_stride,
+                host_buffer + plane0_size, image_info.plane_info[1].row_stride,
+                host_buffer + plane0_size + plane1_size, image_info.plane_info[2].row_stride,
+                image_info.plane_info[0].width, image_info.plane_info[0].height, 8, true);
         }
         image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_SUCCESS);
         return NVIMGCODEC_STATUS_SUCCESS;

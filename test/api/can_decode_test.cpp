@@ -242,6 +242,13 @@ TEST_P(NvImageCodecsCanDecodeApiTest, CanDecode)
     }
 }
 // clang-format off
+std::vector<std::vector<nvimgcodecProcessingStatus_t>> statuses_to_return_image_corrupted_terminal{
+    {NVIMGCODEC_PROCESSING_STATUS_IMAGE_CORRUPTED, NVIMGCODEC_PROCESSING_STATUS_CODEC_UNSUPPORTED},
+    {NVIMGCODEC_PROCESSING_STATUS_SUCCESS}};
+
+std::vector<nvimgcodecProcessingStatus_t> statuses_to_expect_image_corrupted_terminal{
+    NVIMGCODEC_PROCESSING_STATUS_IMAGE_CORRUPTED, NVIMGCODEC_PROCESSING_STATUS_SUCCESS};
+
 test_case_tuple_t can_decode_test_cases[] = {
     {&statuses_to_return_case1_with_force_format_true, true, &statuses_to_expect_for_case1_with_force_format_true},
     {&statuses_to_return_case1_with_force_format_false, false, &statuses_to_expect_for_case1_with_force_format_false},
@@ -250,7 +257,9 @@ test_case_tuple_t can_decode_test_cases[] = {
     {&statuses_to_return_case3_with_force_format_true, true, &statuses_to_expect_for_case3_with_force_format_true},
     {&statuses_to_return_case3_with_force_format_false, false, &statuses_to_expect_for_case3_with_force_format_false},
     {&statuses_to_return_case4_with_force_format_true, true, &statuses_to_expect_for_case4_with_force_format_true},
-    {&statuses_to_return_case4_with_force_format_false, false, &statuses_to_expect_for_case4_with_force_format_false}};
+    {&statuses_to_return_case4_with_force_format_false, false, &statuses_to_expect_for_case4_with_force_format_false},
+    {&statuses_to_return_image_corrupted_terminal, true, &statuses_to_expect_image_corrupted_terminal},
+    {&statuses_to_return_image_corrupted_terminal, false, &statuses_to_expect_image_corrupted_terminal}};
 // clang-format on
 
 INSTANTIATE_TEST_SUITE_P(API_CAN_DECODE, NvImageCodecsCanDecodeApiTest, Combine(::testing::ValuesIn(can_decode_test_cases), ::testing::Values(true, false)));

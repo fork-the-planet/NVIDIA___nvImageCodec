@@ -19,10 +19,12 @@
 
 #include <nvimgcodec_version.h>
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <cuda_runtime_api.h>
 
 #include "codec.h"
@@ -43,40 +45,42 @@ namespace fs = std::filesystem;
 
 namespace nvimgcodec {
 
+char GetPathSeparator()
+{
+#if defined(_WIN32) || defined(_WIN64)
+    return ';';
+#elif defined(__linux__) || defined(__linux) || defined(linux) || defined(_LINUX)
+    return ':';
+#else
+#error "Unsupported platform: nvimgcodec only builds on Linux and Windows"
+#endif
+}
+
+std::string BuildDefaultExtensionsPathFromSoDir(const fs::path& so_dir)
+{
+    // Default extension discovery follows the directory containing the loaded
+    // nvImageCodec runtime library:
+    //
+    //   Package type                 libnvimgcodec lives in           extensions live in
+    //   ---------------------------- -------------------------------- -----------------------------
+    //   Linux deb/rpm               <prefix>/lib*/libnvimgcodec/<cuda>/ <so_dir>/extensions/
+    //   Linux conda package          $CONDA_PREFIX/lib/libnvimgcodec/<cuda>/ <so_dir>/extensions/
+    //   Linux Python wheel           <pkgdir>/                        <pkgdir>/extensions/
+    //   Windows MSI installer        <prefix>/bin/<cuda>/             <so_dir>/extensions/
+    //   Windows conda package        $CONDA_PREFIX/Library/bin/<cuda>/ <so_dir>/extensions/
+    //   Windows Python wheel         <pkgdir>/                        <pkgdir>/extensions/
+    return (so_dir / "extensions").generic_string();
+}
+
 #if defined(__linux__) || defined(__linux) || defined(linux) || defined(_LINUX)
 
 std::string GetDefaultExtensionsPath()
 {
     Dl_info info;
     if (dladdr((const void*)GetDefaultExtensionsPath, &info)) {
-        fs::path path(info.dli_fname);
-        // If this comes from a shared_object in the installation dir,
-        // go level up dir (or two levels when there is lib64, lib or bin) and add "extensions" to the path
-        //
-        // Example paths:
-        // /opt/nvidia/nvimgcodec_cuda12/lib64/libnvimgcodec.so       -> /opt/nvidia/nvimgcodec_cuda12/extensions
-        // /opt/nvidia/nvimgcodec_cuda13/lib/libnvimgcodec.so        -> /opt/nvidia/nvimgcodec_cuda13/extensions
-        // /opt/nvidia/nvimgcodec_cuda12/bin/libnvimgcodec.so        -> /opt/nvidia/nvimgcodec_cuda12/extensions
-        // ~/.local/lib/python3.8/site-packages/nvidia/nvimgcodec/libnvimgcodec.so -> ~/.local/lib/python3.8/site-packages/nvidia/nvimgcodec/extensions
-        path = path.parent_path();
-        if (path.filename().string() == "lib64" ||
-            path.filename().string() == "lib" ||
-            path.filename().string() == "bin") {
-            path = path.parent_path();
-        }
-
-        path /= "extensions";
-        return path.string();
+        return BuildDefaultExtensionsPathFromSoDir(fs::path(info.dli_fname).parent_path());
     }
-    std::stringstream ss;
-
-    ss << "/opt/nvidia/nvimgcodec_cuda" << CUDART_MAJOR_VERSION << "/extensions";
-    return ss.str();
-}
-
-char GetPathSeparator()
-{
-    return ':';
+    return NVIMGCODEC_DEFAULT_EXTENSIONS_PATH;
 }
 
 #elif defined(_WIN32) || defined(_WIN64)
@@ -89,35 +93,15 @@ std::string GetDefaultExtensionsPath()
     if (GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             (LPCSTR)&GetDefaultExtensionsPath, &hm) != 0) {
         if (GetModuleFileName(hm, dll_path, sizeof(dll_path)) != 0) {
-            fs::path path(dll_path);
-            // If this comes from a shared_object in the installation dir,
-            // go level up dir (or two levels when there is yet bin) and add "extensions" to the path
-            // Examples:
-            //
-            // "C:\Program Files\NVIDIA nvImageCodec\v0.3\12\bin\nvimgcodec_0.dll -> C:\Program Files\NVIDIA nvImageCodec\v0.3\12\extensions
-            //  C:/Python39/Lib/site-packages/nvidia/nvimgcodec/nvimgcodec_0.dll -> C:/Python39/Lib/site-packages/nvidia/nvimgcodec/extensions
-            path = path.parent_path();
-            if (path.filename().string() == "bin") {
-                path = path.parent_path();
-            }
-
-            path /= "extensions";
-            return path.string();
+            return BuildDefaultExtensionsPathFromSoDir(fs::path(dll_path).parent_path());
         }
     }
 
-    std::stringstream ss;
-    ss << "C:/Program Files/NVIDIA nvImageCodec/v" << NVIMGCODEC_VER_MAJOR << "." << NVIMGCODEC_VER_MINOR 
-       << "/" << CUDART_MAJOR_VERSION
-       << " / extensions ";
-    return ss.str();
+    return NVIMGCODEC_DEFAULT_EXTENSIONS_PATH;
 }
 
-char GetPathSeparator()
-{
-    return ';';
-}
-
+#else
+#error "Unsupported platform: nvimgcodec only builds on Linux and Windows"
 #endif
 
 PluginFramework::PluginFramework(ILogger* logger, ICodecRegistry* codec_registry, std::unique_ptr<IEnvironment> env,
@@ -309,7 +293,55 @@ void PluginFramework::unregisterAllExtensions()
 
 bool is_extension_disabled(fs::path dir_entry_path)
 {
-    return dir_entry_path.filename().string().front() == '~';
+    const std::string filename = dir_entry_path.filename().string();
+    return !filename.empty() && filename.front() == '~';
+}
+
+std::string lowercase(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+bool is_loadable_extension_module(fs::path dir_entry_path)
+{
+#if defined(_WIN32) || defined(_WIN64)
+    return lowercase(dir_entry_path.extension().string()) == ".dll";
+#elif defined(__linux__) || defined(__linux) || defined(linux) || defined(_LINUX)
+    const std::string filename = lowercase(dir_entry_path.filename().string());
+    const auto so_pos = filename.rfind(".so");
+    if (so_pos == std::string::npos) {
+        return false;
+    }
+
+    const auto suffix_pos = so_pos + 3;
+    if (suffix_pos == filename.size()) {
+        return true;
+    }
+    if (filename[suffix_pos] != '.') {
+        return false;
+    }
+
+    bool expect_digit = true;
+    for (auto it = filename.begin() + suffix_pos + 1; it != filename.end(); ++it) {
+        if (*it == '.') {
+            if (expect_digit) {
+                return false;
+            }
+            expect_digit = true;
+            continue;
+        }
+        if (!std::isdigit(static_cast<unsigned char>(*it))) {
+            return false;
+        }
+        expect_digit = false;
+    }
+    return !expect_digit;
+#else
+#error "Unsupported platform: nvimgcodec only builds on Linux and Windows"
+#endif
 }
 
 void PluginFramework::discoverAndLoadExtModules()
@@ -325,6 +357,12 @@ void PluginFramework::discoverAndLoadExtModules()
             fs::path dir_entry_path = directory_scaner_->next();
             auto status = directory_scaner_->symlinkStatus(dir_entry_path);
             if (fs::is_regular_file(status) || fs::is_symlink(status)) {
+                // Extension install dirs may contain import/static libraries; do
+                // not log load errors for files that are known non-modules.
+                if (!is_loadable_extension_module(dir_entry_path)) {
+                    NVIMGCODEC_LOG_DEBUG(logger_, "Skipping non-extension module [" << dir_entry_path.string() << "]");
+                    continue;
+                }
                 if (is_extension_disabled(dir_entry_path)) {
                     continue;
                 }
@@ -362,6 +400,9 @@ void PluginFramework::loadExtModule(const std::string& modulePath)
     try {
         module.extension_entry_ = reinterpret_cast<nvimgcodecExtensionModuleEntryFunc_t>(
             library_loader_->getFuncAddress(module.lib_handle_, "nvimgcodecExtensionModuleEntry"));
+        if (!module.extension_entry_) {
+            throw std::runtime_error("nvimgcodecExtensionModuleEntry was not found");
+        }
 
     } catch (...) {
         NVIMGCODEC_LOG_ERROR(logger_, "Could not find extension module entry function: " << modulePath);

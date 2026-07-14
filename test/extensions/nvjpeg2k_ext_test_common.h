@@ -190,6 +190,46 @@ class NvJpeg2kTestBase
         ref_buffer_.resize(buffer_size);
         ASSERT_EQ(cudaSuccess, cudaMemcpy(reinterpret_cast<void*>(ref_buffer_.data()), reinterpret_cast<void*>(pBuffer), buffer_size,
                                    ::cudaMemcpyDeviceToHost));
+
+        // Record the valid (written) extent of each component so the comparison can skip the
+        // undefined plane padding. nvjpeg2k writes each component into a full image_width x
+        // image_height slot, but only the component's natural extent is initialized -- for
+        // chroma-subsampled SYCC output that leaves the bottom-right of the chroma planes as
+        // uninitialized device memory. With color conversion the output is full-resolution RGB,
+        // so every component spans the whole image.
+        ref_bytes_per_element_ = bytes_per_element;
+        ref_image_width_ = image_info.image_width;
+        ref_image_height_ = image_info.image_height;
+        ref_num_components_ = image_info.num_components;
+        ref_valid_width_.assign(image_info.num_components, image_info.image_width);
+        ref_valid_height_.assign(image_info.num_components, image_info.image_height);
+        if (!enable_color_convert) {
+            for (uint32_t c = 0; c < image_info.num_components; c++) {
+                ref_valid_width_[c] = image_comp_info[c].component_width;
+                ref_valid_height_[c] = image_comp_info[c].component_height;
+            }
+        }
+    }
+
+    // Compare image_buffer against ref_buffer_ plane-by-plane, only over each component's valid
+    // (written) extent. Planes are laid out as tightly packed image_width x image_height slots with
+    // pitch image_width (matching DecodeReference and the extension's planar output), so undefined
+    // padding past each component's natural width/height is never compared. See ref_valid_*_ above.
+    void AssertReferenceMatchesValidRegion(const std::vector<unsigned char>& image_buffer)
+    {
+        ASSERT_EQ(image_buffer.size(), ref_buffer_.size());
+        const size_t bpe = static_cast<size_t>(ref_bytes_per_element_);
+        const size_t plane_slot = static_cast<size_t>(ref_image_width_) * ref_image_height_ * bpe;
+        const size_t row_pitch = static_cast<size_t>(ref_image_width_) * bpe;
+        for (uint32_t c = 0; c < ref_num_components_; c++) {
+            const size_t plane_off = c * plane_slot;
+            const size_t valid_row_bytes = static_cast<size_t>(ref_valid_width_[c]) * bpe;
+            for (uint32_t y = 0; y < ref_valid_height_[c]; y++) {
+                const size_t off = plane_off + static_cast<size_t>(y) * row_pitch;
+                ASSERT_EQ(0, memcmp(ref_buffer_.data() + off, image_buffer.data() + off, valid_row_bytes))
+                    << "mismatch in component " << c << " row " << y;
+            }
+        }
     }
 
     virtual void EncodeReference(const nvimgcodecImageInfo_t& input_image_info, const nvimgcodecEncodeParams_t& params,
@@ -335,6 +375,14 @@ class NvJpeg2kTestBase
     nvjpeg2kStream_t nvjpeg2k_stream_ = nullptr;
     nvjpeg2kDecodeParams_t nvjpeg2k_decode_params_ = nullptr;
     std::vector<unsigned char> ref_buffer_;
+    // Valid (written) extent of the reference buffer's components; set by DecodeReference and used
+    // by AssertReferenceMatchesValidRegion to avoid comparing undefined plane padding.
+    int ref_bytes_per_element_ = 1;
+    uint32_t ref_image_width_ = 0;
+    uint32_t ref_image_height_ = 0;
+    uint32_t ref_num_components_ = 0;
+    std::vector<uint32_t> ref_valid_width_;
+    std::vector<uint32_t> ref_valid_height_;
 
     nvjpeg2kEncoder_t nvjpeg2k_encoder_handle_ = nullptr;
     nvjpeg2kEncodeState_t nvjpeg2k_encode_state_ = nullptr;

@@ -28,24 +28,31 @@ void colorConvert(cv::Mat& img, cv::ColorConversionCodes conversion)
 }
 
 template <typename DestType, typename SrcType>
-nvimgcodecStatus_t convertPlanarFromCvMat(DestType* destinationBuffer, uint32_t plane_stride, uint32_t row_stride_bytes, const cv::Mat& source_image)
+nvimgcodecStatus_t convertPlanarFromCvMatTyped(const nvimgcodecImageInfo_t& destination, const cv::Mat& source_image)
 {
     using nvimgcodec::ConvertSatNorm;
     std::vector<cv::Mat> planes;
     cv::split(source_image, planes);
     size_t height = source_image.size[0];
     size_t width = source_image.size[1];
+    auto* base = reinterpret_cast<uint8_t*>(destination.buffer);
+    // Each plane honours its own row_stride; the plane start is the running sum
+    // of row_stride * height, so per-plane padding (different strides per plane)
+    // is handled, not just a single shared stride.
+    size_t plane_offset_bytes = 0;
     for (size_t ch = 0; ch < planes.size(); ++ch) {
         const cv::Mat& srcPlane = planes[ch];
         const SrcType* srcPlanePtr = srcPlane.ptr<SrcType>();
-        DestType* destPlanePtr = destinationBuffer + ch * plane_stride;
+        const size_t row_stride_bytes = destination.plane_info[ch].row_stride;
+        uint8_t* destPlanePtr = base + plane_offset_bytes;
         for (size_t i = 0; i < height; ++i) {
             const SrcType* srcRow = srcPlanePtr + i * width;
-            DestType* destRow = reinterpret_cast<DestType*>(reinterpret_cast<uint8_t*>(destPlanePtr) + i * row_stride_bytes);
+            DestType* destRow = reinterpret_cast<DestType*>(destPlanePtr + i * row_stride_bytes);
             for (size_t j = 0; j < width; ++j) {
                 destRow[j] = ConvertSatNorm<DestType>(srcRow[j]);
             }
         }
+        plane_offset_bytes += row_stride_bytes * destination.plane_info[ch].height;
     }
     return NVIMGCODEC_STATUS_SUCCESS;
 }
@@ -76,17 +83,9 @@ nvimgcodecStatus_t convertPlanarFromCvMat(const nvimgcodecImageInfo_t& destinati
     case OUT_SAMPLE_TYPE:                                                                            \
         switch (source.depth()) {                                                                    \
         case CV_8U:                                                                                  \
-            return convertPlanarFromCvMat<OutType, uint8_t>(                                         \
-                reinterpret_cast<OutType*>(destination.buffer),                                      \
-                destination.plane_info[0].row_stride * destination.plane_info[0].height,             \
-                destination.plane_info[0].row_stride,                                                \
-                source);                                                                             \
+            return convertPlanarFromCvMatTyped<OutType, uint8_t>(destination, source);               \
         case CV_16U:                                                                                 \
-            return convertPlanarFromCvMat<OutType, uint16_t>(                                        \
-                reinterpret_cast<OutType*>(destination.buffer),                                      \
-                destination.plane_info[0].row_stride * destination.plane_info[0].height,             \
-                destination.plane_info[0].row_stride,                                                \
-                source);                                                                             \
+            return convertPlanarFromCvMatTyped<OutType, uint16_t>(destination, source);              \
         default:                                                                                     \
             return NVIMGCODEC_STATUS_IMPLEMENTATION_UNSUPPORTED;                                     \
         }                                                                                            \
@@ -146,23 +145,35 @@ nvimgcodecStatus_t convertFromCvMat(nvimgcodecImageInfo_t& destination, const cv
 template <typename SrcType, typename DstType>
 nvimgcodecStatus_t convertPlanarToCvMat(const nvimgcodecImageInfo_t& source, cv::Mat& destination_image)
 {
-    SrcType* sourceBuffer = static_cast<SrcType*>(source.buffer);
-    uint32_t plane_stride = source.plane_info[0].row_stride * source.plane_info[0].height;
-    uint32_t row_stride_bytes = source.plane_info[0].row_stride;
-
     using nvimgcodec::ConvertSatNorm;
+    const uint8_t* base = static_cast<const uint8_t*>(source.buffer);
     size_t height = destination_image.size[0];
     size_t width = destination_image.size[1];
     size_t channels = destination_image.channels();
+    // Per-plane indexing below reads source.plane_info[ch], which is a fixed-size
+    // array of NVIMGCODEC_MAX_NUM_PLANES (32) elements. cv::Mat::channels() can
+    // return up to 512 for malformed inputs; reject anything that would read past
+    // the plane_info[] bound. For well-formed inputs from this codebase
+    // channels == source.num_planes <= NVIMGCODEC_MAX_NUM_PLANES, so this only
+    // catches user error or a future format regression.
+    if (channels > NVIMGCODEC_MAX_NUM_PLANES) {
+        return NVIMGCODEC_STATUS_INVALID_PARAMETER;
+    }
+    // Each plane honours its own row_stride; the plane start is the running sum
+    // of row_stride * height, so per-plane padding (different strides per plane)
+    // is handled, not just a single shared stride.
+    size_t plane_offset_bytes = 0;
     for (size_t ch = 0; ch < channels; ++ch) {
-        const SrcType* srcPlanePtr = sourceBuffer + ch * plane_stride;
+        const size_t row_stride_bytes = source.plane_info[ch].row_stride;
+        const uint8_t* srcPlanePtr = base + plane_offset_bytes;
         for (size_t i = 0; i < height; ++i) {
             DstType* destRow = destination_image.ptr<DstType>() + i * width * channels;
-            const SrcType* srcRow = reinterpret_cast<const SrcType*>(reinterpret_cast<const uint8_t*>(srcPlanePtr) + i * row_stride_bytes);
+            const SrcType* srcRow = reinterpret_cast<const SrcType*>(srcPlanePtr + i * row_stride_bytes);
             for (size_t j = 0; j < width; ++j) {
                 destRow[j * channels + ch] = ConvertSatNorm<DstType>(srcRow[j]);
             }
         }
+        plane_offset_bytes += row_stride_bytes * source.plane_info[ch].height;
     }
     return NVIMGCODEC_STATUS_SUCCESS;
 }

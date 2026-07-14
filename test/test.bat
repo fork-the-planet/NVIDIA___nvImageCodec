@@ -27,8 +27,11 @@ if [%3]==[] (
     set "RUN_SLOW_TESTS=%3"
 )
 
+call :ensure_python
+if %errorlevel% neq 0 exit /b %errorlevel%
+
 echo Creating python virtual environment .nvimgcodec_test_venv
-%PATH_TO_PYTHON%python -m venv .nvimgcodec_test_venv
+"%PYTHON_EXE%" -m venv .nvimgcodec_test_venv
 if %errorlevel% neq 0 exit /b %errorlevel%
 
 echo Activating python virtual environment .nvimgcodec_test_venv
@@ -51,7 +54,10 @@ set PATH=%cd%\.nvimgcodec_test_venv\Lib\site-packages\nvidia\nvjpeg2k\bin;%PATH%
 set PATH=%cd%\.nvimgcodec_test_venv\Lib\site-packages\nvidia\nvtiff\bin;%PATH%
 set PATH=%cd%\.nvimgcodec_test_venv\Lib\site-packages\nvidia\libnvcomp\bin;%PATH%
 
-set NVIMGCODEC_EXTENSIONS_PATH=%cd%\..\extensions
+set "NVIMGCODEC_INSTALL_ROOT=%cd%\.."
+set "PATH=%NVIMGCODEC_INSTALL_ROOT%\bin\%CUDA_VERSION_MAJOR%;%NVIMGCODEC_INSTALL_ROOT%\bin;%PATH%"
+REM Exercise default extension discovery from the installed package-local DLL.
+set "NVIMGCODEC_EXTENSIONS_PATH="
 
 echo Installing nvImageCodec python wheel(s) from current folder
 for %%G in (".\*.whl") do (
@@ -94,3 +100,31 @@ if %TEST_RETURN_CODE% neq 0 echo "tests failed" & exit /b %TEST_RETURN_CODE%
 
 echo Deactivating python virtual environment .nvimgcodec_test_venv
 call deactivate
+
+exit /b %TEST_RETURN_CODE%
+
+:ensure_python
+set "PYTHON_EXE=python"
+set "PYTHON_HOME="
+
+if "%PATH_TO_PYTHON%"=="" exit /b 0
+if /I "%PATH_TO_PYTHON%"=="python" exit /b 0
+if /I "%PATH_TO_PYTHON%"=="py" (
+    set "PYTHON_EXE=py"
+    exit /b 0
+)
+
+set "PYTHON_HOME=%PATH_TO_PYTHON%"
+if not "%PYTHON_HOME:~-1%"=="\" set "PYTHON_HOME=%PYTHON_HOME%\"
+set "PYTHON_EXE=%PYTHON_HOME%python.exe"
+
+if not exist "%PYTHON_EXE%" if exist "%PYTHON_HOME%Scripts\python.exe" (
+    set "PYTHON_EXE=%PYTHON_HOME%Scripts\python.exe"
+)
+
+if not exist "%PYTHON_EXE%" (
+    echo ERROR: Python executable not found at "%PYTHON_HOME%python.exe"
+    echo        Ensure PATH_TO_PYTHON points to a valid Python installation.
+    exit /b 3
+)
+exit /b 0

@@ -40,18 +40,19 @@ class CodeStream
 {
   public:
     CodeStream(nvimgcodecInstance_t instance, ILogger* logger, py::bytes,
-               size_t bitstream_offset = 0, uint32_t limit_images = 0); //For FromMemHost provided by bytes
+               std::optional<size_t> bitstream_offset = std::nullopt); //For FromMemHost provided by bytes
     CodeStream(nvimgcodecInstance_t instance, ILogger* logger, py::array_t<uint8_t>,
-               size_t bitstream_offset = 0, uint32_t limit_images = 0); //For FromMemHost provided by array
+               std::optional<size_t> bitstream_offset = std::nullopt); //For FromMemHost provided by array
 
     CodeStream(nvimgcodecInstance_t instance, ILogger* logger, size_t pre_allocated_size, bool pin_memory = true); //For ToMemHost
     CodeStream(nvimgcodecInstance_t instance, ILogger* logger, nvimgcodecImageInfo_t& out_image_info, bool pin_memory = true); //For ToMemHost
 
     CodeStream(nvimgcodecInstance_t instance, ILogger* logger, const std::filesystem::path& filename,
-               size_t bitstream_offset = 0, uint32_t limit_images = 0); //For FromFile
+               std::optional<size_t> bitstream_offset = std::nullopt); //For FromFile
     CodeStream(nvimgcodecInstance_t instance, ILogger* logger, const std::filesystem::path& filename, nvimgcodecImageInfo_t& out_image_info); //For ToFile
 
-    CodeStream(nvimgcodecInstance_t instance, ILogger* logger, nvimgcodecCodeStream_t code_stream);// For SubCodeStream
+    CodeStream(nvimgcodecInstance_t instance, ILogger* logger, nvimgcodecCodeStream_t code_stream,
+               std::optional<CodeStreamView> view = std::nullopt);// For SubCodeStream
 
     CodeStream(CodeStream&& other) noexcept = default;
     CodeStream& operator=(CodeStream&& other) noexcept = default;
@@ -90,11 +91,13 @@ class CodeStream
 
     nvimgcodecColorSpec_t getColorSpec() const;
     nvimgcodecSampleFormat_t getSampleFormat() const;
+    nvimgcodecChromaSubsampling_t getChromaSubsampling() const;
 
     CodeStream* getSubCodeStream(const CodeStreamView& code_stream_view);
     
-    // TIFF pagination support: returns the offset to the next IFD, or nullopt if none
-    std::optional<size_t> next_bitstream_offset() const;
+    // TIFF IFD traversal support
+    std::optional<size_t> ifd_offset() const;
+    std::optional<size_t> next_ifd_offset() const;
 
     // TIFF SubIFD support: returns list of SubIFD offsets for the current image
     std::vector<size_t> subifd_offsets() const;
@@ -103,7 +106,7 @@ class CodeStream
     const nvimgcodecImageInfo_t& getImageInfo() const;
   private:
     CodeStream(nvimgcodecInstance_t instance, ILogger* logger, const unsigned char* data, size_t length,
-               size_t bitstream_offset = 0, uint32_t limit_images = 0); //For FromMemHost
+               std::optional<size_t> bitstream_offset = std::nullopt); //For FromMemHost
     unsigned char* resize_buffer(size_t bytes);
     static unsigned char* static_resize_buffer(void* ctx, size_t bytes);
 
@@ -119,6 +122,7 @@ class CodeStream
     mutable bool codestream_info_read_ = false;
 
     nvimgcodecCodeStream_t code_stream_ = nullptr;
+    std::optional<CodeStreamView> view_ = std::nullopt;
 
     // Referenced buffers
     // Using those to keep a reference to the argument data,

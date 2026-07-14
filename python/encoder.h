@@ -51,6 +51,8 @@ class Encoder
     std::vector<py::object> write(const std::vector<std::string>& file_names, const std::vector<py::object>& images, const std::string& codec,
         const std::optional<EncodeParams>& params, intptr_t cuda_stream);
 
+    int getDeviceId() const;
+
     py::object enter();
     void exit(const std::optional<pybind11::type>& exc_type, const std::optional<pybind11::object>& exc_value,
         const std::optional<pybind11::object>& traceback);
@@ -59,6 +61,7 @@ class Encoder
 
   private:
     void encode_batch_impl(const std::vector<const Image*>& images, const std::optional<EncodeParams>& params, intptr_t cuda_stream,
+        const std::vector<std::string>& codec_names,
         std::function<void(size_t i, nvimgcodecImageInfo_t& out_image_info, nvimgcodecCodeStream_t* code_stream)> create_code_stream,
         std::function<void(size_t i, bool skip_item)> post_encode_call_back);
     py::object encode_image(const Image* image, const std::string& codec, std::optional<CodeStream*> code_stream,
@@ -75,6 +78,8 @@ class Encoder
     std::shared_ptr<std::remove_pointer<nvimgcodecEncoder_t>::type> encoder_;
     nvimgcodecInstance_t instance_;
     ILogger* logger_;
+    int device_id_;
+    bool is_cpu_only_ = false;
 };
 
 } // namespace nvimgcodec

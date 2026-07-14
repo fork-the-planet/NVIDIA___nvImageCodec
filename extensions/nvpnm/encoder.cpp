@@ -25,6 +25,8 @@
 #include "encoder.h"
 #include "error_handling.h"
 #include "log.h"
+#include "imgproc/image_info_checks.h"
+#include "imgproc/safe_arithmetic.h"
 
 namespace nvpnm {
 
@@ -286,6 +288,10 @@ nvimgcodecProcessingStatus_t EncoderImpl::canEncode(const nvimgcodecCodeStreamDe
             status |= NVIMGCODEC_PROCESSING_STATUS_NUM_PLANES_UNSUPPORTED;
         }
 
+        if (!nvimgcodec::check_planes_consistency(framework_, plugin_id_, image_info)) {
+            status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
+        }
+
         for (uint32_t p = 0; p < image_info.num_planes; ++p) {
             if (image_info.plane_info[p].sample_type != NVIMGCODEC_SAMPLE_DATA_TYPE_UINT8 &&
                 (image_info.plane_info[p].sample_type != NVIMGCODEC_SAMPLE_DATA_TYPE_UINT16)) {
@@ -328,7 +334,9 @@ nvimgcodecStatus_t EncoderImpl::encode(const nvimgcodecCodeStreamDesc_t* code_st
             image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_IMAGE_CORRUPTED);
             return ret;
         }
-        
+
+        nvimgcodec::warn_if_custom_precision_unsupported(framework_, plugin_id_, image_info);
+
         unsigned char* host_buffer = reinterpret_cast<unsigned char*>(image_info.buffer);
 
         if (NVIMGCODEC_SAMPLEFORMAT_I_RGB == image_info.sample_format) {
@@ -337,12 +345,21 @@ nvimgcodecStatus_t EncoderImpl::encode(const nvimgcodecCodeStreamDesc_t* code_st
                 image_info.plane_info[0].height, image_info.plane_info[0].num_channels,
                 image_info.plane_info[0].sample_type == NVIMGCODEC_SAMPLE_DATA_TYPE_UINT8 ? 8 : 16);
         } else if (NVIMGCODEC_SAMPLEFORMAT_P_RGB == image_info.sample_format) {
-            write_pnm<unsigned char>(code_stream->io_stream, host_buffer, image_info.plane_info[0].row_stride,
-                host_buffer + (size_t)image_info.plane_info[0].row_stride * (size_t)image_info.plane_info[0].height,
-                image_info.plane_info[1].row_stride,
-                host_buffer + (size_t)image_info.plane_info[0].row_stride * (size_t)image_info.plane_info[0].height +
-                    image_info.plane_info[1].row_stride * image_info.plane_info[0].height,
-                image_info.plane_info[2].row_stride, NULL, 0, image_info.plane_info[0].width, image_info.plane_info[0].height,
+            // Plane offsets are the running sum of row_stride * height per the
+            // C image_info contract; this keeps offsets correct when planes
+            // carry their own height (e.g. chroma-subsampled YUV), with
+            // overflow checked.
+            size_t plane_offsets[NVIMGCODEC_MAX_NUM_PLANES];
+            if (!nvimgcodec::SafePlaneByteOffsets(image_info, plane_offsets)) {
+                NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Plane byte offsets overflow.");
+                image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_FAIL);
+                return NVIMGCODEC_STATUS_EXECUTION_FAILED;
+            }
+            write_pnm<unsigned char>(code_stream->io_stream, host_buffer,
+                image_info.plane_info[0].row_stride,
+                host_buffer + plane_offsets[1], image_info.plane_info[1].row_stride,
+                host_buffer + plane_offsets[2], image_info.plane_info[2].row_stride,
+                NULL, 0, image_info.plane_info[0].width, image_info.plane_info[0].height,
                 image_info.num_planes, image_info.plane_info[0].sample_type == NVIMGCODEC_SAMPLE_DATA_TYPE_UINT8 ? 8 : 16);
         } else {
             image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_SAMPLE_FORMAT_UNSUPPORTED | NVIMGCODEC_PROCESSING_STATUS_FAIL);

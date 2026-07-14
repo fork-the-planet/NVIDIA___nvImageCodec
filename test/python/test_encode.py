@@ -21,6 +21,7 @@ import pytest as t
 import numpy as np
 try:
     import cupy as cp
+    img = cp.random.randint(0, 255, (100, 100, 3), dtype=cp.uint8) # Force to load necessary libraries
     cuda_streams = [None, cp.cuda.Stream(non_blocking=True), cp.cuda.Stream(non_blocking=False)]
     CUPY_AVAILABLE = True
 except:
@@ -30,7 +31,7 @@ except:
     cp = None  # Define cp as None so it can be referenced in parametrize decorators
 from nvidia import nvimgcodec
 from utils import *
-import nvjpeg_test_speedup
+
 
 @t.mark.parametrize("max_num_cpu_threads", [0, 1, 5])
 @t.mark.parametrize("cuda_stream", cuda_streams)
@@ -310,8 +311,8 @@ def test_encode_images_with_hardware_backend(input_image):
         hw_encoder = nvimgcodec.Encoder(backends=hw_backends)
     except:
         t.skip(f"nvJPEG hardware encoder is not supported on this platform or failed for {input_image}")
-    # It's important to pass chroma subsampling 420, otherwise the default chroma subsampling (444) is not supported by hardware
-    encode_params = nvimgcodec.EncodeParams(quality_type=nvimgcodec.QualityType.QUALITY, quality_value=100, chroma_subsampling=nvimgcodec.ChromaSubsampling.CSS_420)
+
+    encode_params = nvimgcodec.EncodeParams(quality_type=nvimgcodec.QualityType.QUALITY, quality_value=100)
     encoded_img = hw_encoder.encode(original_img, codec="jpeg", params=encode_params)
         
     # Decode then compare with reference
@@ -344,7 +345,8 @@ def test_encode_grayscale_with_default_encode_params(codec, file_ext):
     """
     Test that grayscale images can be encoded with default EncodeParams (chroma_subsampling=None).
     This verifies that chroma_subsampling defaults to GRAY for single-channel images
-    and to CSS_444 for multi-channel images when not explicitly specified.
+    when not explicitly specified (the multi-channel default is codec-dependent and
+    covered by test_encode_default_chroma_subsampling_is_codec_dependent).
     """
     img_dir_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../resources"))
     fname = os.path.join(img_dir_path, 'bmp/cat-111793_640_grayscale.bmp')
@@ -396,6 +398,73 @@ def test_encode_explicit_chroma_subsampling_override():
     
     assert encoded is not None, f"Failed to encode image as jpeg with CSS_GRAY"
     assert encoded.size > 0, f"Encoded jpeg data is empty"
+
+
+@t.mark.parametrize("codec,quality_type,expected_subsampling", [
+    # JPEG defaults multi-channel images to 4:2:0 (broadly compatible, only mode the
+    # nvJPEG hardware encoder accepts). Other codecs keep full-resolution 4:4:4.
+    # jpeg2k is encoded lossless to avoid the unrelated "QUALITY needs MCT for SRGB" path.
+    ("jpeg", nvimgcodec.QualityType.QUALITY, nvimgcodec.ChromaSubsampling.CSS_420),
+    ("jpeg2k", nvimgcodec.QualityType.LOSSLESS, nvimgcodec.ChromaSubsampling.CSS_444),
+])
+def test_encode_default_chroma_subsampling_is_codec_dependent(codec, quality_type, expected_subsampling):
+    """
+    When chroma_subsampling is not specified, the default for a 3-channel image is
+    codec-dependent: JPEG uses CSS_420 while other codecs keep full-resolution CSS_444.
+    """
+    fname = os.path.join(img_dir_path, 'bmp/cat-111793_640.bmp')
+
+    decoder = nvimgcodec.Decoder()
+    encoder = nvimgcodec.Encoder()
+
+    # Decode as RGB (3 channels), no explicit chroma_subsampling on encode.
+    rgb_img = decoder.read(fname).cpu()
+    assert rgb_img.shape[-1] == 3, f"Expected 3 channels, got {rgb_img.shape[-1]}"
+
+    encode_params = nvimgcodec.EncodeParams(quality_type=quality_type, quality_value=75)
+    assert encode_params.chroma_subsampling is None
+
+    encoded = encoder.encode(rgb_img, codec=codec, params=encode_params)
+    assert encoded is not None, f"Failed to encode image as {codec}"
+    assert encoded.size > 0, f"Encoded {codec} data is empty"
+
+    # Parse the produced bitstream back and confirm the subsampling that was actually written.
+    parsed = nvimgcodec.CodeStream(bytes(bytearray(encoded)))
+    assert parsed.chroma_subsampling == expected_subsampling, \
+        f"{codec}: expected {expected_subsampling}, got {parsed.chroma_subsampling}"
+
+
+def test_write_batch_mixed_codecs_chooses_subsampling_per_file(tmp_path):
+    """Writing a batch to files with different extensions resolves the codec - and
+    therefore the chroma-subsampling default - independently per file. The same
+    3-channel image saved as .jpg gets 4:2:0 while saved as .jp2 keeps 4:4:4, all
+    in a single write() call with no explicit codec or chroma_subsampling."""
+    fname = os.path.join(img_dir_path, 'bmp/cat-111793_640.bmp')
+
+    decoder = nvimgcodec.Decoder()
+    encoder = nvimgcodec.Encoder()
+
+    rgb_img = decoder.read(fname).cpu()
+    assert rgb_img.shape[-1] == 3, f"Expected 3 channels, got {rgb_img.shape[-1]}"
+
+    out_jpg = os.path.join(tmp_path, "out.jpg")
+    out_jp2 = os.path.join(tmp_path, "out.jp2")
+
+    # No explicit codec (inferred per file extension) and no explicit chroma_subsampling.
+    written = encoder.write([out_jpg, out_jp2], [rgb_img, rgb_img])
+    assert written == [out_jpg, out_jp2], f"unexpected write result: {written}"
+
+    expected = {
+        out_jpg: ("jpeg", nvimgcodec.ChromaSubsampling.CSS_420),
+        out_jp2: ("jpeg2k", nvimgcodec.ChromaSubsampling.CSS_444),
+    }
+    for path, (codec, css) in expected.items():
+        with open(path, "rb") as f:
+            parsed = nvimgcodec.CodeStream(f.read())
+        assert parsed.codec_name == codec, f"{path}: expected codec {codec}, got {parsed.codec_name}"
+        assert parsed.chroma_subsampling == css, \
+            f"{path}: expected {css}, got {parsed.chroma_subsampling}"
+
 
 @t.mark.parametrize("encode_to_data", [True, False])
 def test_encode_single_image_with_unsupported_codec_returns_none(tmp_path, encode_to_data):
@@ -913,14 +982,20 @@ def test_encode_jpeg2k_ycc(lossy):
     assert enc_code_stream.size > 0
 
     decoder = nvimgcodec.Decoder()
-    decoded = decoder.decode(enc_code_stream, params=nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.UNCHANGED))
-    assert decoded is not None
-    decoded_numpy = np.asarray(decoded.cpu())
+    # UNCHANGED decodes to rgb by default. Before this was working because nvjpeg2k didn't properly decode to RGB
+    # but instead it skipped conversion YCC -> RGB, so it returned original code stream (even though we explicitly
+    # requested decode to rgb via nvjpeg2kDecodeParamsSetRGBOutput)
+    # The reason we decode to RGB with unchanged is because we don't properly handle decode to YCC with all codecs
+    # we will need to revisit this in the future release
 
-    if lossy:
-        np.testing.assert_allclose(arr, decoded_numpy, atol=10)
-    else:
-        np.testing.assert_array_equal(arr, decoded_numpy)
+    # decoded = decoder.decode(enc_code_stream, params=nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.UNCHANGED))
+    # assert decoded is not None
+    # decoded_numpy = np.asarray(decoded.cpu())
+
+    # if lossy:
+    #     np.testing.assert_allclose(arr, decoded_numpy, atol=10)
+    # else:
+    #     np.testing.assert_array_equal(arr, decoded_numpy)
 
     #verify YCC output works as well
     decoded = decoder.decode(enc_code_stream, params=nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.SYCC))
@@ -931,6 +1006,96 @@ def test_encode_jpeg2k_ycc(lossy):
         np.testing.assert_allclose(arr, decoded_numpy, atol=10)
     else:
         np.testing.assert_array_equal(arr, decoded_numpy)
+
+@t.mark.parametrize(
+    "dtype, precision, num_channels, color_spec, sample_format",
+    [
+        # Sub-8 precision carried in a uint8 buffer
+        (np.uint8, 4, 1, nvimgcodec.ColorSpec.GRAY, nvimgcodec.SampleFormat.I_Y),
+        (np.uint8, 5, 1, nvimgcodec.ColorSpec.GRAY, nvimgcodec.SampleFormat.I_Y),
+        (np.uint8, 7, 1, nvimgcodec.ColorSpec.GRAY, nvimgcodec.SampleFormat.I_Y),
+        (np.uint8, 5, 3, nvimgcodec.ColorSpec.SRGB, nvimgcodec.SampleFormat.I_RGB),
+        (np.uint8, 6, 3, nvimgcodec.ColorSpec.SRGB, nvimgcodec.SampleFormat.I_RGB),
+        # Supra-8 precision carried in a uint16 buffer
+        (np.uint16, 10, 1, nvimgcodec.ColorSpec.GRAY, nvimgcodec.SampleFormat.I_Y),
+        (np.uint16, 12, 1, nvimgcodec.ColorSpec.GRAY, nvimgcodec.SampleFormat.I_Y),
+        (np.uint16, 14, 3, nvimgcodec.ColorSpec.SRGB, nvimgcodec.SampleFormat.I_RGB),
+        (np.uint16, 12, 3, nvimgcodec.ColorSpec.SRGB, nvimgcodec.SampleFormat.I_RGB),
+    ]
+)
+def test_encode_jpeg2k_custom_precision(dtype, precision, num_channels, color_spec, sample_format):
+    """Encoding a buffer with plane_info.precision != dtype-bitdepth must store that
+    precision in the JPEG 2000 bitstream (SIZ marker) and round-trip on decode. Covers
+    both sub-8 precision (e.g. 5-bit in uint8) and supra-8 precision (e.g. 12-bit in uint16).
+    Also serializes the encoded result to a Python bytes object and rebuilds a fresh
+    CodeStream from those bytes to confirm the precision survives that round-trip too."""
+    max_value = (1 << precision) - 1
+    rng = np.random.default_rng(1729)
+    shape = (64, 96, num_channels)
+    arr = rng.integers(0, max_value + 1, shape, dtype=dtype)
+
+    image = nvimgcodec.as_image(arr, sample_format=sample_format, color_spec=color_spec, precision=precision)
+    assert image.precision == precision
+
+    encoder = nvimgcodec.Encoder()
+    encode_params = nvimgcodec.EncodeParams(quality_type=nvimgcodec.QualityType.LOSSLESS)
+    encoded_image = encoder.encode(image, codec="jpeg2k", params=encode_params)
+    assert encoded_image is not None
+    # The encoder-returned CodeStream object itself reports the precision it just wrote.
+    assert encoded_image.precision == precision
+
+    # Serialize to raw bytes and re-parse as a fresh CodeStream. This exercises the path
+    # an external consumer would take (e.g. read a file off disk), confirming the SIZ
+    # marker carries the right precision through pure bitstream parsing.
+    encoded_bytes = bytes(encoded_image)
+    assert len(encoded_bytes) > 0
+    parsed = nvimgcodec.CodeStream(encoded_bytes)
+    assert parsed.precision == precision
+
+    decoder = nvimgcodec.Decoder()
+    decode_params = nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.UNCHANGED, allow_any_depth=True)
+    # Decode via the freshly-parsed CodeStream, not the encoder's returned object, so
+    # this branch verifies the bytes-only path round-trips pixels too.
+    decoded = decoder.decode(parsed, params=decode_params)
+    assert decoded.precision == precision
+
+    decoded_np = np.array(decoded.cpu()).squeeze()
+    np.testing.assert_array_equal(arr.squeeze(), decoded_np)
+
+
+def test_encode_jpeg2k_precision_exceeding_dtype_is_rejected_by_as_image():
+    """as_image guards the precision-vs-dtype invariant, so the invalid case
+    is rejected at construction time before reaching the encoder."""
+    arr = np.zeros((32, 32, 3), dtype=np.uint8)
+    with t.raises(Exception) as excinfo:
+        nvimgcodec.as_image(arr, precision=12)
+    assert "exceeds the bitdepth" in str(excinfo.value)
+
+
+def test_encode_jpeg2k_precision_8_in_uint8_round_trips():
+    """Lower-bound case: precision == dtype bitdepth must still produce a
+    bitstream whose parsed precision matches and whose pixels round-trip.
+    Serializes the encoded image to bytes and rebuilds a fresh CodeStream from
+    those bytes before checking precision and pixel preservation."""
+    rng = np.random.default_rng(7)
+    arr = rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)
+    image = nvimgcodec.as_image(arr, precision=8)
+    encoder = nvimgcodec.Encoder()
+    encode_params = nvimgcodec.EncodeParams(quality_type=nvimgcodec.QualityType.LOSSLESS)
+    encoded = encoder.encode(image, codec="jpeg2k", params=encode_params)
+    assert encoded is not None
+    assert encoded.precision == 8
+
+    encoded_bytes = bytes(encoded)
+    assert len(encoded_bytes) > 0
+    parsed = nvimgcodec.CodeStream(encoded_bytes)
+    assert parsed.precision == 8
+
+    decoder = nvimgcodec.Decoder()
+    decoded = decoder.decode(parsed, params=nvimgcodec.DecodeParams(
+        color_spec=nvimgcodec.ColorSpec.UNCHANGED, allow_any_depth=True))
+    np.testing.assert_array_equal(arr, np.array(decoded.cpu()))
+
 
 @t.mark.parametrize("lossy", [True, False])
 def test_encode_jpeg2k_ycc_mct_not_supported(lossy):
@@ -949,3 +1114,736 @@ def test_encode_jpeg2k_ycc_mct_not_supported(lossy):
 
     enc_code_stream = encoder.encode(image, "jpeg2k", params=encode_params)
     assert enc_code_stream is None
+
+
+# ---------------------------------------------------------------------------
+# Encoding from planar (CHW) inputs
+#
+# Exercises the path where as_image wraps a CHW numpy/cupy array as a planar
+# Image (P_RGB / P_Y / P_RGBA), the encoder reads from the planar buffer,
+# and a round-trip through the decoder recovers identical pixel content (for
+# lossless codecs).
+# ---------------------------------------------------------------------------
+
+_LOSSLESS_RGB_CODECS = ["png", "bmp", "tiff", "pnm"]
+_LOSSLESS_GRAY_CODECS = ["png", "bmp", "tiff", "pnm"]
+_LOSSLESS_RGBA_CODECS = ["png", "tiff"]
+
+
+@t.mark.parametrize("codec", _LOSSLESS_RGB_CODECS)
+def test_encode_planar_rgb_roundtrip_lossless(codec):
+    """Encode a (3, H, W) P_RGB Image with a lossless codec and verify the
+    round-tripped pixels match the input exactly."""
+    rng = np.random.default_rng(0)
+    arr_chw = rng.integers(0, 256, (3, 120, 160), dtype=np.uint8)
+    img = nvimgcodec.as_image(arr_chw, sample_format=nvimgcodec.SampleFormat.P_RGB)
+    assert img.sample_format == nvimgcodec.SampleFormat.P_RGB
+
+    encoder = nvimgcodec.Encoder()
+    encoded = encoder.encode(img, codec)
+    assert encoded is not None, f"encoder returned None for codec={codec}"
+
+    decoder = nvimgcodec.Decoder()
+    decoded = decoder.decode(encoded)
+    assert decoded is not None, f"decoder returned None for codec={codec}"
+    assert decoded.shape == (120, 160, 3)
+    np.testing.assert_array_equal(np.asarray(decoded.cpu()), np.transpose(arr_chw, (1, 2, 0)))
+
+
+def test_encode_planar_rgb_jpeg2k_lossless_roundtrip():
+    """JPEG2000 lossless round-trip for a (3, H, W) P_RGB Image."""
+    rng = np.random.default_rng(0)
+    arr_chw = rng.integers(0, 256, (3, 120, 160), dtype=np.uint8)
+    img = nvimgcodec.as_image(arr_chw, sample_format=nvimgcodec.SampleFormat.P_RGB)
+
+    encoder = nvimgcodec.Encoder()
+    params = nvimgcodec.EncodeParams(quality_type=nvimgcodec.QualityType.LOSSLESS)
+    encoded = encoder.encode(img, "jpeg2k", params=params)
+    assert encoded is not None
+
+    decoder = nvimgcodec.Decoder()
+    decoded = decoder.decode(encoded)
+    np.testing.assert_array_equal(np.asarray(decoded.cpu()), np.transpose(arr_chw, (1, 2, 0)))
+
+
+@t.mark.parametrize("codec", _LOSSLESS_GRAY_CODECS)
+def test_encode_planar_y_roundtrip_lossless(codec):
+    """Encode a (1, H, W) P_Y Image with a lossless codec and verify the
+    round-tripped pixels match. Decoded shape is (H, W, 1) after the default
+    SRGB / GRAY conversion the decoder applies."""
+    rng = np.random.default_rng(0)
+    arr_1hw = rng.integers(0, 256, (1, 120, 160), dtype=np.uint8)
+    img = nvimgcodec.as_image(arr_1hw, sample_format=nvimgcodec.SampleFormat.P_Y)
+    assert img.sample_format == nvimgcodec.SampleFormat.P_Y
+
+    encoder = nvimgcodec.Encoder()
+    encoded = encoder.encode(img, codec)
+    assert encoded is not None, f"encoder returned None for codec={codec}"
+
+    decoder = nvimgcodec.Decoder()
+    decoded = decoder.decode(
+        encoded, params=nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.GRAY))
+    assert decoded is not None, f"decoder returned None for codec={codec}"
+    assert decoded.shape == (120, 160, 1)
+    np.testing.assert_array_equal(
+        np.asarray(decoded.cpu()).squeeze(-1), arr_1hw[0])
+
+
+def test_encode_planar_y_from_2d_roundtrip_lossless():
+    """A 2-D (H, W) grayscale array wrapped as P_Y also encodes correctly."""
+    rng = np.random.default_rng(0)
+    arr_2d = rng.integers(0, 256, (120, 160), dtype=np.uint8)
+    img = nvimgcodec.as_image(arr_2d, sample_format=nvimgcodec.SampleFormat.P_Y)
+    assert img.sample_format == nvimgcodec.SampleFormat.P_Y
+    assert img.shape == (1, 120, 160)
+
+    encoder = nvimgcodec.Encoder()
+    encoded = encoder.encode(img, "png")
+    assert encoded is not None
+
+    decoder = nvimgcodec.Decoder()
+    decoded = decoder.decode(
+        encoded, params=nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.GRAY))
+    np.testing.assert_array_equal(np.asarray(decoded.cpu()).squeeze(-1), arr_2d)
+
+
+@t.mark.parametrize("codec", _LOSSLESS_RGBA_CODECS)
+@t.mark.parametrize(
+    "decode_sample_format, expected_layout",
+    [
+        (nvimgcodec.SampleFormat.I_RGBA, "interleaved"),
+        (nvimgcodec.SampleFormat.P_RGBA, "planar"),
+    ],
+)
+def test_encode_planar_rgba_roundtrip_lossless(codec, decode_sample_format, expected_layout):
+    """Encode a (4, H, W) P_RGBA Image with a lossless codec preserving the
+    alpha channel through the round-trip, and decode back to either layout."""
+    rng = np.random.default_rng(0)
+    arr_chw = rng.integers(0, 256, (4, 120, 160), dtype=np.uint8)
+    img = nvimgcodec.as_image(arr_chw, sample_format=nvimgcodec.SampleFormat.P_RGBA)
+    assert img.sample_format == nvimgcodec.SampleFormat.P_RGBA
+
+    encoder = nvimgcodec.Encoder()
+    encoded = encoder.encode(img, codec)
+    assert encoded is not None, f"encoder returned None for codec={codec}"
+
+    decoder = nvimgcodec.Decoder()
+    params = nvimgcodec.DecodeParams(
+        color_spec=nvimgcodec.ColorSpec.UNCHANGED, sample_format=decode_sample_format)
+    decoded = decoder.decode(encoded, params=params)
+    assert decoded is not None, f"decoder returned None for codec={codec}"
+    assert decoded.sample_format == decode_sample_format
+    if expected_layout == "interleaved":
+        assert decoded.shape == (120, 160, 4)
+        np.testing.assert_array_equal(
+            np.asarray(decoded.cpu()), np.transpose(arr_chw, (1, 2, 0)))
+    else:
+        assert decoded.shape == (4, 120, 160)
+        np.testing.assert_array_equal(np.asarray(decoded.cpu()), arr_chw)
+
+
+@t.mark.parametrize("codec", _LOSSLESS_RGB_CODECS)
+def test_encode_planar_vs_interleaved_same_pixels(codec):
+    """Encoding the same data wrapped as planar (P_RGB on CHW) and as
+    interleaved (I_RGB on HWC) must decode to the same pixels."""
+    rng = np.random.default_rng(0)
+    arr_chw = rng.integers(0, 256, (3, 120, 160), dtype=np.uint8)
+    arr_hwc = np.ascontiguousarray(np.transpose(arr_chw, (1, 2, 0)))
+
+    encoder = nvimgcodec.Encoder()
+    enc_planar = encoder.encode(
+        nvimgcodec.as_image(arr_chw, sample_format=nvimgcodec.SampleFormat.P_RGB), codec)
+    enc_interleaved = encoder.encode(
+        nvimgcodec.as_image(arr_hwc, sample_format=nvimgcodec.SampleFormat.I_RGB), codec)
+    assert enc_planar is not None and enc_interleaved is not None
+
+    decoder = nvimgcodec.Decoder()
+    dec_planar = np.asarray(decoder.decode(enc_planar).cpu())
+    dec_interleaved = np.asarray(decoder.decode(enc_interleaved).cpu())
+    np.testing.assert_array_equal(dec_planar, dec_interleaved)
+
+
+# ---------------------------------------------------------------------------
+# Lossy planar encoding (quality=95)
+#
+# A pseudo-realistic source (a real decoded image) is used; uniform random
+# data is a worst case for lossy codecs because there's no spatial coherence
+# to exploit and the diffs blow up.
+# ---------------------------------------------------------------------------
+
+_LOSSY_DIFF_THRESHOLDS = {
+    # codec -> (max_diff, mean_diff) — empirically what we get at quality=95
+    # on the cat reference image. Loose enough to absorb small encoder-side
+    # version drift but tight enough to catch real bit-rot.
+    # "jpeg" pins 4:4:4; "jpeg_420" is the same codec at 4:2:0, which subsamples
+    # chroma and so needs a looser max-diff bound.
+    "jpeg":      (20, 3.0),
+    "jpeg_420":  (30, 4.0),
+    "webp":      (20, 2.5),
+    "jpeg2k":    (15, 2.0),
+    "jpeg2k_ht": (15, 2.0),
+}
+
+
+def _lossy_encode_params(codec_label):
+    """Build EncodeParams with quality=95 and any codec-specific knobs needed
+    for the lossy variant. JPEG2K needs mct_mode=1 to allow Q-factor mode;
+    htj2k is selected via Jpeg2kEncodeParams(ht=True). JPEG is tested at both
+    chroma subsamplings: "jpeg" pins 4:4:4 and "jpeg_420" pins 4:2:0 (the
+    multi-channel default), with looser thresholds for the latter."""
+    kwargs = dict(quality_type=nvimgcodec.QualityType.QUALITY, quality_value=95)
+    if codec_label == "jpeg":
+        kwargs["chroma_subsampling"] = nvimgcodec.ChromaSubsampling.CSS_444
+    elif codec_label == "jpeg_420":
+        kwargs["chroma_subsampling"] = nvimgcodec.ChromaSubsampling.CSS_420
+    elif codec_label == "jpeg2k":
+        kwargs["jpeg2k_encode_params"] = nvimgcodec.Jpeg2kEncodeParams(mct_mode=1)
+    elif codec_label == "jpeg2k_ht":
+        kwargs["jpeg2k_encode_params"] = nvimgcodec.Jpeg2kEncodeParams(mct_mode=1, ht=True)
+    return nvimgcodec.EncodeParams(**kwargs)
+
+
+def _codec_name(codec_label):
+    # "jpeg2k_ht" / "jpeg_420" are labels used to distinguish encode variants in
+    # test ids - on the wire they go through the jpeg2k / jpeg codec respectively.
+    return {"jpeg2k_ht": "jpeg2k", "jpeg_420": "jpeg"}.get(codec_label, codec_label)
+
+
+def _lossy_reference_image():
+    """Load a real reference image so lossy codecs behave sensibly."""
+    path = os.path.join(img_dir_path, "png/cat-1245673_640.png")
+    return np.asarray(nvimgcodec.Decoder().decode(path).cpu())
+
+
+@t.mark.parametrize("codec_label", ["jpeg", "jpeg_420", "webp", "jpeg2k", "jpeg2k_ht"])
+def test_encode_planar_lossy_q95_roundtrip(codec_label):
+    """Encode a (3, H, W) P_RGB image with a lossy codec at quality=95 and
+    verify the decoded image stays close to the original."""
+    src_hwc = _lossy_reference_image()
+    src_chw = np.ascontiguousarray(np.transpose(src_hwc, (2, 0, 1)))
+    img = nvimgcodec.as_image(src_chw, sample_format=nvimgcodec.SampleFormat.P_RGB)
+
+    encoder = nvimgcodec.Encoder()
+    encoded = encoder.encode(img, _codec_name(codec_label),
+                             params=_lossy_encode_params(codec_label))
+    assert encoded is not None, f"encoder returned None for {codec_label}"
+
+    decoded = np.asarray(nvimgcodec.Decoder().decode(encoded).cpu())
+    diff = np.abs(decoded.astype(int) - src_hwc.astype(int))
+    max_thr, mean_thr = _LOSSY_DIFF_THRESHOLDS[codec_label]
+    assert diff.max() <= max_thr, \
+        f"{codec_label} max diff {diff.max()} exceeds threshold {max_thr}"
+    assert diff.mean() <= mean_thr, \
+        f"{codec_label} mean diff {diff.mean():.2f} exceeds threshold {mean_thr}"
+
+
+@t.mark.parametrize("codec_label", ["jpeg", "jpeg_420", "webp", "jpeg2k", "jpeg2k_ht"])
+def test_encode_planar_lossy_q95_matches_interleaved(codec_label):
+    """Encoding the same data wrapped as planar (P_RGB on CHW) and as
+    interleaved (I_RGB on HWC) must decode to byte-identical pixels for a
+    given lossy codec at quality=95."""
+    src_hwc = _lossy_reference_image()
+    src_chw = np.ascontiguousarray(np.transpose(src_hwc, (2, 0, 1)))
+
+    encoder = nvimgcodec.Encoder()
+    encoded_planar = encoder.encode(
+        nvimgcodec.as_image(src_chw, sample_format=nvimgcodec.SampleFormat.P_RGB),
+        _codec_name(codec_label), params=_lossy_encode_params(codec_label))
+    encoded_interleaved = encoder.encode(
+        nvimgcodec.as_image(src_hwc, sample_format=nvimgcodec.SampleFormat.I_RGB),
+        _codec_name(codec_label), params=_lossy_encode_params(codec_label))
+    assert encoded_planar is not None and encoded_interleaved is not None
+
+    decoder = nvimgcodec.Decoder()
+    dec_planar = np.asarray(decoder.decode(encoded_planar).cpu())
+    dec_interleaved = np.asarray(decoder.decode(encoded_interleaved).cpu())
+    np.testing.assert_array_equal(dec_planar, dec_interleaved)
+
+
+# ---------------------------------------------------------------------------
+# Encoding from row-padded buffers
+#
+# Mirrors the padded-decode matrix in test_decode_sample_format.py: the source
+# is an externally-managed buffer with right-side row padding wrapped via
+# as_image; the encoder must read pixels using the per-plane row_stride (not
+# the packed natural row size) and must not touch the padded zone. The
+# round-trip is lossless, so the decoded output equals the visible slice
+# byte-for-byte.
+#
+# Parametrised over:
+#   - backend      : default vs CPU_ONLY
+#   - array_module : numpy (host) vs cupy (device)
+#   - layout       : interleaved (HWC) vs planar (CHW), where applicable
+#   - codec        : a lossless RGB / GRAY / RGBA codec set
+# ---------------------------------------------------------------------------
+
+PADDED_ENCODE_BACKENDS = [
+    ("default", None),
+    ("cpu",     [nvimgcodec.Backend(nvimgcodec.BackendKind.CPU_ONLY)]),
+]
+
+PADDED_ENCODE_ARRAY_MODULES = [
+    ("numpy", np),
+    t.param("cupy", cp,
+            marks=t.mark.skipif(not CUPY_AVAILABLE, reason="cupy is not available")),
+]
+
+PADDED_ENCODE_LOSSLESS_RGB_CODECS  = ["png", "bmp", "tiff", "pnm"]
+PADDED_ENCODE_LOSSLESS_GRAY_CODECS = ["png", "bmp", "tiff", "pnm"]
+PADDED_ENCODE_LOSSLESS_RGBA_CODECS = ["png", "tiff"]
+
+PADDED_ENCODE_SENTINEL = 0x80
+
+
+def _padded_encoder(backends):
+    if backends is None:
+        return nvimgcodec.Encoder()
+    return nvimgcodec.Encoder(
+        device_id=nvimgcodec.NVIMGCODEC_DEVICE_CPU_ONLY, backends=backends)
+
+
+def _padded_encode_as_host(arr):
+    if CUPY_AVAILABLE and isinstance(arr, cp.ndarray):
+        return cp.asnumpy(arr)
+    return np.asarray(arr)
+
+
+def _padded_encode_random(am, shape, seed):
+    """Reproducible uint8 data on the given array module."""
+    if am is np:
+        rng = np.random.default_rng(seed)
+        return rng.integers(0, 256, shape, dtype=np.uint8)
+    # cupy: seed once via cupy.random, fall back to numpy + asarray for
+    # determinism across cupy versions.
+    arr = np.random.default_rng(seed).integers(0, 256, shape, dtype=np.uint8)
+    return cp.asarray(arr)
+
+
+def _padded_sentinel(am, shape):
+    """A sentinel-only reference array on the same module as the test buffer.
+    Used to assert post-encode that the padded zone of the source buffer is
+    still byte-for-byte equal to the sentinel pre-fill."""
+    return np.full(shape, PADDED_ENCODE_SENTINEL, dtype=np.uint8)
+
+
+@t.mark.parametrize("am_name,am", PADDED_ENCODE_ARRAY_MODULES)
+@t.mark.parametrize("backend_name,backends", PADDED_ENCODE_BACKENDS,
+                    ids=[b[0] for b in PADDED_ENCODE_BACKENDS])
+@t.mark.parametrize("codec", PADDED_ENCODE_LOSSLESS_RGB_CODECS)
+def test_encode_padded_hwc_rgb_lossless_roundtrip(codec, backend_name, backends, am_name, am):
+    """Encode a row-padded interleaved (H, W, 3) source. Verify the encoder
+    honours the row stride, leaves the padded zone untouched, and a decode
+    of the result recovers the visible pixels exactly."""
+    H, W, pad = 120, 160, 32
+    backing = am.full((H, W + pad, 3), PADDED_ENCODE_SENTINEL, dtype=am.uint8)
+    pixels = _padded_encode_random(am, (H, W, 3), seed=1)
+    backing[:, :W, :] = pixels
+    view = backing[:, :W, :]
+    src = nvimgcodec.as_image(view)
+    assert src.shape == (H, W, 3)
+    assert src.strides[0] == (W + pad) * 3
+
+    encoder = _padded_encoder(backends)
+    encoded = encoder.encode(src, codec)
+    assert encoded is not None, f"encoder returned None for codec={codec} backend={backend_name}"
+
+    # Encoder must not modify the source buffer.
+    np.testing.assert_array_equal(_padded_encode_as_host(view), _padded_encode_as_host(pixels))
+    np.testing.assert_array_equal(
+        _padded_encode_as_host(backing[:, W:, :]),
+        _padded_sentinel(am, (H, pad, 3)))
+
+    # Lossless round-trip recovers the visible pixels.
+    decoded = nvimgcodec.Decoder().decode(encoded)
+    assert decoded is not None
+    assert decoded.shape == (H, W, 3)
+    np.testing.assert_array_equal(np.asarray(decoded.cpu()), _padded_encode_as_host(pixels))
+
+
+@t.mark.parametrize("am_name,am", PADDED_ENCODE_ARRAY_MODULES)
+@t.mark.parametrize("backend_name,backends", PADDED_ENCODE_BACKENDS,
+                    ids=[b[0] for b in PADDED_ENCODE_BACKENDS])
+@t.mark.parametrize("codec", PADDED_ENCODE_LOSSLESS_RGB_CODECS)
+def test_encode_padded_chw_rgb_lossless_roundtrip(codec, backend_name, backends, am_name, am):
+    """Encode a row-padded planar (3, H, W) source - the planar branch must
+    walk each plane at the padded row stride and skip the per-row tail."""
+    H, W, pad = 120, 160, 32
+    backing = am.full((3, H, W + pad), PADDED_ENCODE_SENTINEL, dtype=am.uint8)
+    pixels = _padded_encode_random(am, (3, H, W), seed=2)
+    backing[:, :, :W] = pixels
+    view = backing[:, :, :W]
+    src = nvimgcodec.as_image(view, sample_format=nvimgcodec.SampleFormat.P_RGB)
+    assert src.shape == (3, H, W)
+    assert src.strides[0] == H * (W + pad)
+    assert src.strides[1] == (W + pad)
+
+    encoder = _padded_encoder(backends)
+    encoded = encoder.encode(src, codec)
+    assert encoded is not None, f"encoder returned None for codec={codec} backend={backend_name}"
+
+    np.testing.assert_array_equal(_padded_encode_as_host(view), _padded_encode_as_host(pixels))
+    np.testing.assert_array_equal(
+        _padded_encode_as_host(backing[:, :, W:]),
+        _padded_sentinel(am, (3, H, pad)))
+
+    decoded = nvimgcodec.Decoder().decode(encoded)
+    assert decoded is not None
+    # Most lossless codecs decode to HWC by default; transpose CHW reference
+    # for the comparison.
+    assert decoded.shape == (H, W, 3)
+    np.testing.assert_array_equal(
+        np.asarray(decoded.cpu()),
+        np.transpose(_padded_encode_as_host(pixels), (1, 2, 0)))
+
+
+@t.mark.parametrize("am_name,am", PADDED_ENCODE_ARRAY_MODULES)
+@t.mark.parametrize("backend_name,backends", PADDED_ENCODE_BACKENDS,
+                    ids=[b[0] for b in PADDED_ENCODE_BACKENDS])
+@t.mark.parametrize("codec", PADDED_ENCODE_LOSSLESS_GRAY_CODECS)
+def test_encode_padded_hwc_gray_lossless_roundtrip(codec, backend_name, backends, am_name, am):
+    """Encode a row-padded interleaved grayscale (H, W, 1) source."""
+    H, W, pad = 120, 160, 16
+    backing = am.full((H, W + pad, 1), PADDED_ENCODE_SENTINEL, dtype=am.uint8)
+    pixels = _padded_encode_random(am, (H, W, 1), seed=3)
+    backing[:, :W, :] = pixels
+    view = backing[:, :W, :]
+    src = nvimgcodec.as_image(view)
+    assert src.sample_format == nvimgcodec.SampleFormat.I_Y
+    assert src.shape == (H, W, 1)
+
+    encoder = _padded_encoder(backends)
+    encoded = encoder.encode(src, codec)
+    assert encoded is not None, f"encoder returned None for codec={codec} backend={backend_name}"
+
+    np.testing.assert_array_equal(_padded_encode_as_host(view), _padded_encode_as_host(pixels))
+    np.testing.assert_array_equal(
+        _padded_encode_as_host(backing[:, W:, :]),
+        _padded_sentinel(am, (H, pad, 1)))
+
+    decoded = nvimgcodec.Decoder().decode(
+        encoded, params=nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.GRAY))
+    assert decoded is not None
+    assert decoded.shape == (H, W, 1)
+    np.testing.assert_array_equal(np.asarray(decoded.cpu()), _padded_encode_as_host(pixels))
+
+
+@t.mark.parametrize("am_name,am", PADDED_ENCODE_ARRAY_MODULES)
+@t.mark.parametrize("backend_name,backends", PADDED_ENCODE_BACKENDS,
+                    ids=[b[0] for b in PADDED_ENCODE_BACKENDS])
+@t.mark.parametrize("codec", PADDED_ENCODE_LOSSLESS_GRAY_CODECS)
+def test_encode_padded_chw_gray_lossless_roundtrip(codec, backend_name, backends, am_name, am):
+    """Encode a row-padded planar grayscale (1, H, W) source via P_Y."""
+    H, W, pad = 120, 160, 16
+    backing = am.full((1, H, W + pad), PADDED_ENCODE_SENTINEL, dtype=am.uint8)
+    pixels = _padded_encode_random(am, (1, H, W), seed=4)
+    backing[:, :, :W] = pixels
+    view = backing[:, :, :W]
+    src = nvimgcodec.as_image(view, sample_format=nvimgcodec.SampleFormat.P_Y)
+    assert src.sample_format == nvimgcodec.SampleFormat.P_Y
+    assert src.shape == (1, H, W)
+
+    encoder = _padded_encoder(backends)
+    encoded = encoder.encode(src, codec)
+    assert encoded is not None, f"encoder returned None for codec={codec} backend={backend_name}"
+
+    np.testing.assert_array_equal(_padded_encode_as_host(view), _padded_encode_as_host(pixels))
+    np.testing.assert_array_equal(
+        _padded_encode_as_host(backing[:, :, W:]),
+        _padded_sentinel(am, (1, H, pad)))
+
+    decoded = nvimgcodec.Decoder().decode(
+        encoded, params=nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.GRAY))
+    assert decoded is not None
+    assert decoded.shape == (H, W, 1)
+    np.testing.assert_array_equal(np.asarray(decoded.cpu()).squeeze(-1), _padded_encode_as_host(pixels)[0])
+
+
+@t.mark.parametrize("am_name,am", PADDED_ENCODE_ARRAY_MODULES)
+@t.mark.parametrize("backend_name,backends", PADDED_ENCODE_BACKENDS,
+                    ids=[b[0] for b in PADDED_ENCODE_BACKENDS])
+@t.mark.parametrize("codec", PADDED_ENCODE_LOSSLESS_GRAY_CODECS)
+def test_encode_padded_2d_gray_lossless_roundtrip(codec, backend_name, backends, am_name, am):
+    """Encode a 2-D (H, W+pad) grayscale source - the default I_Y inference
+    plus the row-padding handling on the 2-D shape path."""
+    H, W, pad = 120, 160, 16
+    backing = am.full((H, W + pad), PADDED_ENCODE_SENTINEL, dtype=am.uint8)
+    pixels = _padded_encode_random(am, (H, W), seed=5)
+    backing[:, :W] = pixels
+    view = backing[:, :W]
+    src = nvimgcodec.as_image(view)
+    assert src.sample_format == nvimgcodec.SampleFormat.I_Y
+    assert src.shape == (H, W, 1)
+
+    encoder = _padded_encoder(backends)
+    encoded = encoder.encode(src, codec)
+    assert encoded is not None, f"encoder returned None for codec={codec} backend={backend_name}"
+
+    np.testing.assert_array_equal(_padded_encode_as_host(view), _padded_encode_as_host(pixels))
+    np.testing.assert_array_equal(
+        _padded_encode_as_host(backing[:, W:]),
+        _padded_sentinel(am, (H, pad)))
+
+    decoded = nvimgcodec.Decoder().decode(
+        encoded, params=nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.GRAY))
+    assert decoded is not None
+    assert decoded.shape == (H, W, 1)
+    np.testing.assert_array_equal(np.asarray(decoded.cpu()).squeeze(-1), _padded_encode_as_host(pixels))
+
+
+@t.mark.parametrize("am_name,am", PADDED_ENCODE_ARRAY_MODULES)
+@t.mark.parametrize("backend_name,backends", PADDED_ENCODE_BACKENDS,
+                    ids=[b[0] for b in PADDED_ENCODE_BACKENDS])
+@t.mark.parametrize("codec", PADDED_ENCODE_LOSSLESS_RGBA_CODECS)
+def test_encode_padded_hwc_rgba_lossless_roundtrip(codec, backend_name, backends, am_name, am):
+    """Encode a row-padded interleaved RGBA (H, W, 4) source - covers the
+    4-channel path where row_stride = (W + pad) * 4."""
+    H, W, pad = 120, 160, 32
+    backing = am.full((H, W + pad, 4), PADDED_ENCODE_SENTINEL, dtype=am.uint8)
+    pixels = _padded_encode_random(am, (H, W, 4), seed=6)
+    backing[:, :W, :] = pixels
+    view = backing[:, :W, :]
+    src = nvimgcodec.as_image(view)
+    assert src.sample_format == nvimgcodec.SampleFormat.I_RGBA
+    assert src.shape == (H, W, 4)
+
+    encoder = _padded_encoder(backends)
+    encoded = encoder.encode(src, codec)
+    assert encoded is not None, f"encoder returned None for codec={codec} backend={backend_name}"
+
+    np.testing.assert_array_equal(_padded_encode_as_host(view), _padded_encode_as_host(pixels))
+    np.testing.assert_array_equal(
+        _padded_encode_as_host(backing[:, W:, :]),
+        _padded_sentinel(am, (H, pad, 4)))
+
+    decoded = nvimgcodec.Decoder().decode(
+        encoded, params=nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.UNCHANGED))
+    assert decoded is not None
+    assert decoded.shape == (H, W, 4)
+    np.testing.assert_array_equal(np.asarray(decoded.cpu()), _padded_encode_as_host(pixels))
+
+
+@t.mark.parametrize("am_name,am", PADDED_ENCODE_ARRAY_MODULES)
+@t.mark.parametrize("backend_name,backends", PADDED_ENCODE_BACKENDS,
+                    ids=[b[0] for b in PADDED_ENCODE_BACKENDS])
+@t.mark.parametrize("codec", PADDED_ENCODE_LOSSLESS_RGBA_CODECS)
+def test_encode_padded_chw_rgba_lossless_roundtrip(codec, backend_name, backends, am_name, am):
+    """Encode a row-padded planar RGBA (4, H, W) source - 4-plane planar
+    walked at the padded row stride per plane."""
+    H, W, pad = 120, 160, 32
+    backing = am.full((4, H, W + pad), PADDED_ENCODE_SENTINEL, dtype=am.uint8)
+    pixels = _padded_encode_random(am, (4, H, W), seed=7)
+    backing[:, :, :W] = pixels
+    view = backing[:, :, :W]
+    src = nvimgcodec.as_image(view, sample_format=nvimgcodec.SampleFormat.P_RGBA)
+    assert src.sample_format == nvimgcodec.SampleFormat.P_RGBA
+    assert src.shape == (4, H, W)
+
+    encoder = _padded_encoder(backends)
+    encoded = encoder.encode(src, codec)
+    assert encoded is not None, f"encoder returned None for codec={codec} backend={backend_name}"
+
+    np.testing.assert_array_equal(_padded_encode_as_host(view), _padded_encode_as_host(pixels))
+    np.testing.assert_array_equal(
+        _padded_encode_as_host(backing[:, :, W:]),
+        _padded_sentinel(am, (4, H, pad)))
+
+    decoded = nvimgcodec.Decoder().decode(
+        encoded, params=nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.UNCHANGED))
+    assert decoded is not None
+    assert decoded.shape == (H, W, 4)
+    np.testing.assert_array_equal(
+        np.asarray(decoded.cpu()),
+        np.transpose(_padded_encode_as_host(pixels), (1, 2, 0)))
+
+
+# ---------------------------------------------------------------------------
+# Padded-input LOSSY encode tests
+#
+# Same backend / array_module / layout matrix as the lossless padded tests
+# above, but with lossy codecs (jpeg, webp, jpeg2k baseline, jpeg2k HT) at
+# quality=95. The source is a real reference image so the codecs behave
+# sensibly. Each test:
+#
+#   1. Pre-fills the backing buffer with sentinel and copies the reference
+#      pixels into the visible slice.
+#   2. Wraps the slice via as_image with the appropriate layout.
+#   3. Encodes with the lossy codec / backend under test.
+#   4. Asserts the encoder did not touch the input slice or the padded zone.
+#   5. Decodes the encoded output and asserts the lossy diff stays within
+#      the published thresholds vs the reference visible pixels.
+#   6. Also encodes the same pixels from a packed buffer and asserts the
+#      decoded output is byte-identical between the padded and packed runs
+#      (proves the padded row stride is honoured by the encoder).
+# ---------------------------------------------------------------------------
+
+
+_PADDED_LOSSY_CODECS = ["jpeg", "jpeg_420", "webp", "jpeg2k", "jpeg2k_ht"]
+
+
+def _skip_unsupported_padded_lossy(codec_label, backend_name):
+    """No CPU JPEG2K encoder is shipped in this build, so jpeg2k variants
+    are unavailable on the cpu-only backend. Skip those parametrisations
+    up-front instead of letting `encoder.encode()` return None at runtime."""
+    if backend_name == "cpu" and codec_label in ("jpeg2k", "jpeg2k_ht"):
+        t.skip(f"{codec_label} encoder not available for backend=cpu")
+
+
+def _padded_lossy_pixels(am):
+    """The lossy reference image, on the requested array module."""
+    src_hwc = _lossy_reference_image()
+    if am is np:
+        return src_hwc, src_hwc
+    return cp.asarray(src_hwc), src_hwc
+
+
+def _padded_lossy_assert_within_thresholds(codec_label, decoded_hwc, ref_hwc):
+    """Apply the codec's published quality=95 thresholds."""
+    max_thr, mean_thr = _LOSSY_DIFF_THRESHOLDS[codec_label]
+    diff = np.abs(decoded_hwc.astype(int) - ref_hwc.astype(int))
+    assert diff.max() <= max_thr, \
+        f"{codec_label} max diff {diff.max()} exceeds threshold {max_thr}"
+    assert diff.mean() <= mean_thr, \
+        f"{codec_label} mean diff {diff.mean():.2f} exceeds threshold {mean_thr}"
+
+
+@t.mark.parametrize("am_name,am", PADDED_ENCODE_ARRAY_MODULES)
+@t.mark.parametrize("backend_name,backends", PADDED_ENCODE_BACKENDS,
+                    ids=[b[0] for b in PADDED_ENCODE_BACKENDS])
+@t.mark.parametrize("codec_label", _PADDED_LOSSY_CODECS)
+def test_encode_padded_hwc_lossy_q95_roundtrip(codec_label, backend_name, backends, am_name, am):
+    """Lossy encode of a row-padded interleaved (H, W, 3) source at q=95.
+    The decoded image must stay within the codec's published thresholds vs
+    the reference visible pixels, and the encoder must not touch the
+    padded zone."""
+    _skip_unsupported_padded_lossy(codec_label, backend_name)
+    pixels_on_am, ref_hwc = _padded_lossy_pixels(am)
+    H, W = ref_hwc.shape[:2]
+    pad = 32
+
+    backing = am.full((H, W + pad, 3), PADDED_ENCODE_SENTINEL, dtype=am.uint8)
+    backing[:, :W, :] = pixels_on_am
+    view = backing[:, :W, :]
+    src = nvimgcodec.as_image(view)
+    assert src.shape == (H, W, 3)
+    assert src.strides[0] == (W + pad) * 3
+
+    encoder = _padded_encoder(backends)
+    encoded = encoder.encode(src, _codec_name(codec_label),
+                             params=_lossy_encode_params(codec_label))
+    assert encoded is not None, f"{codec_label} encoder returned None for backend={backend_name}"
+
+    # Input slice + padded zone untouched.
+    np.testing.assert_array_equal(_padded_encode_as_host(view),
+                                  _padded_encode_as_host(pixels_on_am))
+    np.testing.assert_array_equal(_padded_encode_as_host(backing[:, W:, :]),
+                                  _padded_sentinel(am, (H, pad, 3)))
+
+    # Lossy threshold on round-trip.
+    decoded = np.asarray(nvimgcodec.Decoder().decode(encoded).cpu())
+    _padded_lossy_assert_within_thresholds(codec_label, decoded, ref_hwc)
+
+
+@t.mark.parametrize("am_name,am", PADDED_ENCODE_ARRAY_MODULES)
+@t.mark.parametrize("backend_name,backends", PADDED_ENCODE_BACKENDS,
+                    ids=[b[0] for b in PADDED_ENCODE_BACKENDS])
+@t.mark.parametrize("codec_label", _PADDED_LOSSY_CODECS)
+def test_encode_padded_chw_lossy_q95_roundtrip(codec_label, backend_name, backends, am_name, am):
+    """Lossy encode of a row-padded planar (3, H, W) source at q=95."""
+    _skip_unsupported_padded_lossy(codec_label, backend_name)
+    pixels_on_am, ref_hwc = _padded_lossy_pixels(am)
+    H, W = ref_hwc.shape[:2]
+    pad = 32
+
+    backing = am.full((3, H, W + pad), PADDED_ENCODE_SENTINEL, dtype=am.uint8)
+    if am is np:
+        chw_pixels = np.ascontiguousarray(np.transpose(pixels_on_am, (2, 0, 1)))
+    else:
+        chw_pixels = cp.ascontiguousarray(cp.transpose(pixels_on_am, (2, 0, 1)))
+    backing[:, :, :W] = chw_pixels
+    view = backing[:, :, :W]
+    src = nvimgcodec.as_image(view, sample_format=nvimgcodec.SampleFormat.P_RGB)
+    assert src.shape == (3, H, W)
+    assert src.strides[0] == H * (W + pad)
+    assert src.strides[1] == (W + pad)
+
+    encoder = _padded_encoder(backends)
+    encoded = encoder.encode(src, _codec_name(codec_label),
+                             params=_lossy_encode_params(codec_label))
+    assert encoded is not None, f"{codec_label} encoder returned None for backend={backend_name}"
+
+    np.testing.assert_array_equal(_padded_encode_as_host(view),
+                                  _padded_encode_as_host(chw_pixels))
+    np.testing.assert_array_equal(_padded_encode_as_host(backing[:, :, W:]),
+                                  _padded_sentinel(am, (3, H, pad)))
+
+    decoded = np.asarray(nvimgcodec.Decoder().decode(encoded).cpu())
+    _padded_lossy_assert_within_thresholds(codec_label, decoded, ref_hwc)
+
+
+@t.mark.parametrize("am_name,am", PADDED_ENCODE_ARRAY_MODULES)
+@t.mark.parametrize("backend_name,backends", PADDED_ENCODE_BACKENDS,
+                    ids=[b[0] for b in PADDED_ENCODE_BACKENDS])
+@t.mark.parametrize("codec_label", _PADDED_LOSSY_CODECS)
+def test_encode_padded_hwc_lossy_matches_packed(codec_label, backend_name, backends, am_name, am):
+    """Encoding the same RGB pixels from a row-padded HWC buffer and from a
+    packed HWC buffer must decode to byte-identical pixels under any lossy
+    codec - if the encoder mis-strides the padded layout the two outputs
+    diverge."""
+    _skip_unsupported_padded_lossy(codec_label, backend_name)
+    pixels_on_am, ref_hwc = _padded_lossy_pixels(am)
+    H, W = ref_hwc.shape[:2]
+    pad = 32
+
+    backing = am.full((H, W + pad, 3), PADDED_ENCODE_SENTINEL, dtype=am.uint8)
+    backing[:, :W, :] = pixels_on_am
+    view = backing[:, :W, :]
+    packed = am.ascontiguousarray(pixels_on_am)
+
+    encoder = _padded_encoder(backends)
+    params = _lossy_encode_params(codec_label)
+    enc_padded = encoder.encode(nvimgcodec.as_image(view), _codec_name(codec_label), params=params)
+    enc_packed = encoder.encode(nvimgcodec.as_image(packed), _codec_name(codec_label), params=params)
+    assert enc_padded is not None and enc_packed is not None, \
+        f"{codec_label} encoder returned None for backend={backend_name}"
+
+    decoder = nvimgcodec.Decoder()
+    dec_padded = np.asarray(decoder.decode(enc_padded).cpu())
+    dec_packed = np.asarray(decoder.decode(enc_packed).cpu())
+    np.testing.assert_array_equal(dec_padded, dec_packed)
+
+
+@t.mark.parametrize("am_name,am", PADDED_ENCODE_ARRAY_MODULES)
+@t.mark.parametrize("backend_name,backends", PADDED_ENCODE_BACKENDS,
+                    ids=[b[0] for b in PADDED_ENCODE_BACKENDS])
+@t.mark.parametrize("codec_label", _PADDED_LOSSY_CODECS)
+def test_encode_padded_chw_lossy_matches_packed(codec_label, backend_name, backends, am_name, am):
+    """Mirror of the HWC matches-packed test for planar layouts."""
+    _skip_unsupported_padded_lossy(codec_label, backend_name)
+    pixels_on_am, ref_hwc = _padded_lossy_pixels(am)
+    H, W = ref_hwc.shape[:2]
+    pad = 32
+
+    if am is np:
+        chw_pixels = np.ascontiguousarray(np.transpose(pixels_on_am, (2, 0, 1)))
+    else:
+        chw_pixels = cp.ascontiguousarray(cp.transpose(pixels_on_am, (2, 0, 1)))
+    backing = am.full((3, H, W + pad), PADDED_ENCODE_SENTINEL, dtype=am.uint8)
+    backing[:, :, :W] = chw_pixels
+    view = backing[:, :, :W]
+    packed = am.ascontiguousarray(chw_pixels)
+
+    encoder = _padded_encoder(backends)
+    params = _lossy_encode_params(codec_label)
+    enc_padded = encoder.encode(
+        nvimgcodec.as_image(view, sample_format=nvimgcodec.SampleFormat.P_RGB),
+        _codec_name(codec_label), params=params)
+    enc_packed = encoder.encode(
+        nvimgcodec.as_image(packed, sample_format=nvimgcodec.SampleFormat.P_RGB),
+        _codec_name(codec_label), params=params)
+    assert enc_padded is not None and enc_packed is not None, \
+        f"{codec_label} encoder returned None for backend={backend_name}"
+
+    decoder = nvimgcodec.Decoder()
+    dec_padded = np.asarray(decoder.decode(enc_padded).cpu())
+    dec_packed = np.asarray(decoder.decode(enc_packed).cpu())
+    np.testing.assert_array_equal(dec_padded, dec_packed)

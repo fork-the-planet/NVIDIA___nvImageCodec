@@ -127,8 +127,12 @@ TEST_P(NvJpeg2kExtDecoderTestSingleImage, ValidFormatAndParameters)
             ref_buffer_.data() + (image_info_.plane_info[0].height * image_info_.plane_info[0].width) * 2, image_info_.plane_info[0].width,
             image_info_.plane_info[0].width, image_info_.plane_info[0].height);
     }
-    ASSERT_EQ(image_buffer_.size(), ref_buffer_.size());
-    ASSERT_EQ(0, memcmp(reinterpret_cast<void*>(ref_buffer_.data()), reinterpret_cast<void*>(image_buffer_.data()), image_buffer_.size()));
+    // Compare only each component's valid (written) extent. For chroma-subsampled SYCC output the
+    // reference buffer's chroma planes are full image_width x image_height slots but only the
+    // subsampled top-left is written; the rest is undefined device memory whose contents depend on
+    // unrelated prior GPU activity. Comparing the full buffer therefore made the test depend on
+    // pool residue (a latent flake exposed by test ordering).
+    ASSERT_NO_FATAL_FAILURE(AssertReferenceMatchesValidRegion(image_buffer_));
 }
 
 static const char* css_filenames[] = {"/jpeg2k/chroma_420/artificial_420_8b3c_dwt97CPRL.jp2",
@@ -247,10 +251,7 @@ class NvJpeg2kExtDecoderTestRef : public CommonExtDecoderTestWithPathAndFormat
     }
 };
 
-TEST_P(NvJpeg2kExtDecoderTestRef, SingleImage)
-{
-    TestSingleImage(image_path, sample_format);
-}
+DEFINE_SINGLE_IMAGE_STRIDE_TESTS(NvJpeg2kExtDecoderTestRef)
 
 INSTANTIATE_TEST_SUITE_P(NVJPEG2K_DECODE,
     NvJpeg2kExtDecoderTestRef,
@@ -264,6 +265,44 @@ INSTANTIATE_TEST_SUITE_P(NVJPEG2K_DECODE,
             NVIMGCODEC_SAMPLEFORMAT_P_UNCHANGED,
             NVIMGCODEC_SAMPLEFORMAT_P_Y
         )
+    )
+);
+
+// Higher-precision (uint16) reference decode tests; same extension setup as
+// NvJpeg2kExtDecoderTestRef, driven through the path+format+type fixture.
+class NvJpeg2kExtDecoderTestRefHighPrec : public CommonExtDecoderTestWithPathFormatAndType
+{
+  public:
+    void SetUp() override
+    {
+        CommonExtDecoderTestWithPathFormatAndType::SetUp();
+
+        nvimgcodecExtensionDesc_t nvjpeg2k_parser_extension_desc{
+            NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_jpeg2k_parser_extension_desc(&nvjpeg2k_parser_extension_desc));
+        extensions_.emplace_back();
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &nvjpeg2k_parser_extension_desc));
+
+        nvimgcodecExtensionDesc_t nvjpeg2k_extension_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_nvjpeg2k_extension_desc(&nvjpeg2k_extension_desc));
+        extensions_.emplace_back();
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &nvjpeg2k_extension_desc));
+
+        CommonExtDecoderTestWithPathFormatAndType::CreateDecoder();
+    }
+};
+
+DEFINE_SINGLE_IMAGE_HIGHPREC_STRIDE_TESTS(NvJpeg2kExtDecoderTestRefHighPrec)
+
+// nvjpeg2k's decoder does not support BGR output (mirroring the uint8
+// NVJPEG2K_DECODE suite, which only exercises RGB / UNCHANGED / Y), so the
+// higher-precision suite uses the interleaved and planar RGB layouts.
+INSTANTIATE_TEST_SUITE_P(NVJPEG2K_DECODE_HIGHPREC_UINT16,
+    NvJpeg2kExtDecoderTestRefHighPrec,
+    Combine(
+        Values("jpeg2k/cat-1046544_640-16bit.jp2"),
+        Values(NVIMGCODEC_SAMPLEFORMAT_I_RGB, NVIMGCODEC_SAMPLEFORMAT_P_RGB),
+        Values(NVIMGCODEC_SAMPLE_DATA_TYPE_UINT16)
     )
 );
 

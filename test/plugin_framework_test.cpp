@@ -70,25 +70,45 @@ TEST(PluginFrameworkTest, test_ext_module_discovery)
     std::unique_ptr<MockDirectoryScaner> directory_scaner = std::make_unique<MockDirectoryScaner>();
     EXPECT_CALL(*directory_scaner.get(), start(_)).Times(1);
     EXPECT_CALL(*directory_scaner.get(), hasMore())
-        .Times(5)
+        .Times(7)
+        .WillOnce(Return(true))
+        .WillOnce(Return(true))
         .WillOnce(Return(true))
         .WillOnce(Return(true))
         .WillOnce(Return(true))
         .WillOnce(Return(true))
         .WillOnce(Return(false));
 
+#if defined(_WIN32) || defined(_WIN64)
+    const std::string shared_library_ext = ".dll";
+    const std::string static_library_ext = ".lib";
+#else
+    const std::string shared_library_ext = ".so";
+    const std::string static_library_ext = ".a";
+#endif
+    const fs::path module0 = std::string("nvjpeg_ext_0") + shared_library_ext;
+    const fs::path module1 = std::string("nvjpeg2k_ext_0") + shared_library_ext;
+    const fs::path disabled_extension_module = std::string("~libtiff_ext_0") + shared_library_ext;
+    const fs::path module2 = std::string("opencv_ext_0") + shared_library_ext;
+    const fs::path ignored_non_module = std::string("opencv_ext") + static_library_ext;
+    const fs::path ignored_backup_module = std::string("opencv_ext_0") + shared_library_ext + ".backup";
+
     EXPECT_CALL(*directory_scaner.get(), next())
-        .Times(4)
-        .WillOnce(Return("libnvjpeg.so.22.11.0.0"))
-        .WillOnce(Return("libnvjpeg2k.so.0.6.0.0"))
-        .WillOnce(Return("~libtiff.so.0.6.0.0"))
-        .WillOnce(Return("libnvjpeg2k.so.0"));
+        .Times(6)
+        .WillOnce(Return(module0))
+        .WillOnce(Return(module1))
+        .WillOnce(Return(disabled_extension_module))
+        .WillOnce(Return(module2))
+        .WillOnce(Return(ignored_non_module))
+        .WillOnce(Return(ignored_backup_module));
     EXPECT_CALL(*directory_scaner.get(), symlinkStatus(_))
-        .Times(4)
+        .Times(6)
         .WillOnce(Return(fs::file_status(fs::file_type::regular)))
         .WillOnce(Return(fs::file_status(fs::file_type::regular)))
         .WillOnce(Return(fs::file_status(fs::file_type::regular)))
-        .WillOnce(Return(fs::file_status(fs::file_type::symlink)));
+        .WillOnce(Return(fs::file_status(fs::file_type::regular)))
+        .WillOnce(Return(fs::file_status(fs::file_type::symlink)))
+        .WillOnce(Return(fs::file_status(fs::file_type::regular)));
     EXPECT_CALL(*directory_scaner.get(), exists(_)).WillRepeatedly(Return(true));
 
     std::unique_ptr<MockLibraryLoader> library_loader = std::make_unique<MockLibraryLoader>();
@@ -107,6 +127,25 @@ TEST(PluginFrameworkTest, test_ext_module_discovery)
     MockLogger logger;
     PluginFramework framework(&logger, &codec_registry, std::move(env), std::move(directory_scaner), std::move(library_loader), "");
     framework.discoverAndLoadExtModules();
+}
+
+TEST(PluginFrameworkTest, test_ext_module_without_entry_func_is_unloaded)
+{
+    MockCodecRegistry codec_registry;
+
+    std::unique_ptr<MockEnvironment> env = std::make_unique<MockEnvironment>();
+    std::unique_ptr<MockDirectoryScaner> directory_scaner = std::make_unique<MockDirectoryScaner>();
+
+    std::unique_ptr<MockLibraryLoader> library_loader = std::make_unique<MockLibraryLoader>();
+    ILibraryLoader::LibraryHandle handle = reinterpret_cast<ILibraryLoader::LibraryHandle>(0x1234);
+    EXPECT_CALL(*library_loader.get(), loadLibrary(Eq("not_an_extension.dll"))).Times(1).WillOnce(Return(handle));
+    EXPECT_CALL(*library_loader.get(), getFuncAddress(handle, Eq("nvimgcodecExtensionModuleEntry"))).Times(1).WillOnce(Return(nullptr));
+    EXPECT_CALL(*library_loader.get(), unloadLibrary(handle)).Times(1);
+
+    MockLogger logger;
+    PluginFramework framework(
+        &logger, &codec_registry, std::move(env), std::move(directory_scaner), std::move(library_loader), "unused");
+    framework.loadExtModule("not_an_extension.dll");
 }
 
 class PluginFrameworkExtensionsPathTest : public ::testing::Test
@@ -160,8 +199,27 @@ TEST_F(PluginFrameworkExtensionsPathTest, test_extension_path_for_empty_env_and_
 {
     std::string env_test_path{""};
     std::string soft_test_path{""};
-    std::string expected_test_path{GetDefaultExtensionsPath()};
-    TestExtensionsOnePath(env_test_path, soft_test_path, expected_test_path);
+    std::vector<std::string> expected_test_paths;
+    std::stringstream ss(GetDefaultExtensionsPath());
+    std::string current_path;
+    while (std::getline(ss, current_path, GetPathSeparator())) {
+        expected_test_paths.push_back(current_path);
+    }
+    TestExtensionsMultiplePaths(env_test_path, soft_test_path, expected_test_paths);
+}
+
+TEST(PluginFrameworkDefaultExtensionsPathTest, returns_extensions_under_so_dir)
+{
+    EXPECT_EQ(BuildDefaultExtensionsPathFromSoDir("/usr/lib64/libnvimgcodec/12"),
+        std::string("/usr/lib64/libnvimgcodec/12/extensions"));
+    EXPECT_EQ(BuildDefaultExtensionsPathFromSoDir("/home/u/miniconda/envs/codec/lib/libnvimgcodec/12"),
+        std::string("/home/u/miniconda/envs/codec/lib/libnvimgcodec/12/extensions"));
+    EXPECT_EQ(BuildDefaultExtensionsPathFromSoDir("/home/u/.local/lib/python3.10/site-packages/nvidia/nvimgcodec"),
+        std::string("/home/u/.local/lib/python3.10/site-packages/nvidia/nvimgcodec/extensions"));
+    EXPECT_EQ(BuildDefaultExtensionsPathFromSoDir("/usr/local/lib64/libnvimgcodec/12"),
+        std::string("/usr/local/lib64/libnvimgcodec/12/extensions"));
+    EXPECT_EQ(BuildDefaultExtensionsPathFromSoDir("C:/Program Files/NVIDIA nvImageCodec/bin/12"),
+        std::string("C:/Program Files/NVIDIA nvImageCodec/bin/12/extensions"));
 }
 
 TEST_F(PluginFrameworkExtensionsPathTest, test_extension_path_for_filled_env_and_empty_soft_return_env)

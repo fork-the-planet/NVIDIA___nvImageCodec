@@ -131,7 +131,7 @@ void EncodeParams::exportToPython(py::module& m)
 
                 color_spec (ColorSpec): Output color specification. Defaults to UNCHANGED.
 
-                chroma_subsampling (ChromaSubsampling): Chroma subsampling format. When not specified, defaults to CSS_GRAY for single-channel (grayscale) images and CSS_444 for multi-channel images.
+                chroma_subsampling (ChromaSubsampling): Chroma subsampling format. When not specified, the default is inferred from the image and codec at encode time: for images with at least 3 channels, CSS_420 for JPEG and CSS_444 for other codecs; CSS_GRAY otherwise (images with fewer than 3 channels).
 
                 jpeg_encode_params (JpegEncodeParams): Optional JPEG specific encoding parameters.
                 
@@ -155,7 +155,7 @@ void EncodeParams::exportToPython(py::module& m)
             )pbdoc")
         .def_property("chroma_subsampling", &EncodeParams::getChromaSubsampling, &EncodeParams::setChromaSubsampling,
             R"pbdoc(
-            Specifies the chroma subsampling format for encoding. When not specified, defaults to CSS_GRAY for single-channel (grayscale) images and CSS_444 for multi-channel images.
+            Specifies the chroma subsampling format for encoding. When not specified, the default is inferred from the image and codec at encode time: for images with at least 3 channels, CSS_420 for JPEG and CSS_444 for other codecs; CSS_GRAY otherwise (images with fewer than 3 channels).
             )pbdoc")
         .def_property("jpeg_params", &EncodeParams::getJpegEncodeParams, &EncodeParams::setJpegEncodeParams,
             R"pbdoc(

@@ -74,6 +74,18 @@ class JPEGParserPluginTest : public ::testing::Test
     nvimgcodecCodeStream_t stream_handle_ = nullptr;
 };
 
+TEST_F(JPEGParserPluginTest, TruncatedSofMarkerReturnsBadCodestream)
+{
+    const std::vector<uint8_t> truncated_jpeg = {
+        0xff, 0xd8,  // SOI
+        0xff, 0xc3, 0x00  // truncated SOF3 segment length
+    };
+    LoadImageFromHostMemory(instance_, stream_handle_, truncated_jpeg.data(), truncated_jpeg.size());
+
+    nvimgcodecImageInfo_t info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};
+    ASSERT_EQ(NVIMGCODEC_STATUS_BAD_CODESTREAM, nvimgcodecCodeStreamGetImageInfo(stream_handle_, &info));
+}
+
 TEST_F(JPEGParserPluginTest, YCC_410) {
     LoadImageFromFilename(instance_, stream_handle_, resources_dir + "/jpeg/padlock-406986_640_410.jpg");
     nvimgcodecImageInfo_t info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};

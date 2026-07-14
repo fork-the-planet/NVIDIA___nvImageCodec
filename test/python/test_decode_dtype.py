@@ -19,7 +19,7 @@ import numpy as np
 from nvidia import nvimgcodec
 import pytest as t
 from utils import img_dir_path
-import nvjpeg_test_speedup
+
 
 debug_output = False
 
@@ -45,7 +45,9 @@ def impl_decode_single_jpeg2k_dtype_with_precision(img_path, shape, dtype, preci
     img_u8 = decoder.read(input_img_path, params=nvimgcodec.DecodeParams(allow_any_depth=False))
     assert img_u8.shape == shape
     assert img_u8.dtype == np.uint8
-    assert img_u8.precision == 0
+    # When allow_any_depth=False, the decoder leaves plane_info.precision unset (0 internally),
+    # which the Python property now resolves to the dtype bitdepth (8 for uint8).
+    assert img_u8.precision == 8
     data_u8 = np.array(img_u8.cpu())
     if debug_output:
         nvimgcodec.Encoder().write("b.bmp", data_u8)

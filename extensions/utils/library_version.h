@@ -27,9 +27,9 @@ struct LibraryVersion {
     int patch_ver = -1;
     bool valid = false;
 
-    LibraryVersion(int _major, int _minor, int _patch)
+    constexpr LibraryVersion(int _major, int _minor, int _patch)
         : major_ver(_major), minor_ver(_minor), patch_ver(_patch), valid(true) {}
-    LibraryVersion() : valid(false) {}
+    constexpr LibraryVersion() : valid(false) {}
 
     int flat_version() const {
         if (!valid) {

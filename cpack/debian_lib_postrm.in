@@ -16,13 +16,7 @@
 # limitations under the License.
 
 case "$1" in
-    remove|deconfigure)
-        rm -f /etc/ld.so.conf.d/@CPACK_PACKAGE_NAME@.conf
-        if [ -f /etc/ld.so.conf.d/.cvcuda_created ]; then
-            rm /etc/ld.so.conf.d/.nvimgcodec_created
-            rmdir --ignore-fail-on-non-empty /etc/ld.so.conf.d
-        fi
-
+    remove|purge)
         ldconfig
         ;;
 esac

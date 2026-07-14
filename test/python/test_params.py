@@ -50,6 +50,7 @@ def test_decode_params():
     assert (decode_params.apply_exif_orientation == True)
     assert (decode_params.allow_any_depth == False)
     assert (decode_params.color_spec == nvimgcodec.SRGB)
+    assert (decode_params.sample_format == nvimgcodec.I_UNCHANGED)
 
     decode_params.apply_exif_orientation = False
     assert (decode_params.apply_exif_orientation == False)
@@ -69,16 +70,29 @@ def test_decode_params():
     decode_params.color_spec = nvimgcodec.SRGB
     assert (decode_params.color_spec == nvimgcodec.SRGB)
 
+    decode_params.sample_format = nvimgcodec.P_UNCHANGED
+    assert (decode_params.sample_format == nvimgcodec.P_UNCHANGED)
+
+    decode_params.sample_format = nvimgcodec.P_RGB
+    assert (decode_params.sample_format == nvimgcodec.P_RGB)
+
     # DecodeParams constructor with parameters
-    decode_params = nvimgcodec.DecodeParams(False, nvimgcodec.SYCC, True)
+    decode_params = nvimgcodec.DecodeParams(False, nvimgcodec.SYCC, True, nvimgcodec.SampleFormat.P_RGB)
     assert (decode_params.apply_exif_orientation == False)
     assert (decode_params.allow_any_depth == True)
     assert (decode_params.color_spec == nvimgcodec.SYCC)
+    assert (decode_params.sample_format == nvimgcodec.P_RGB)
 
-    decode_params = nvimgcodec.DecodeParams(allow_any_depth=True, color_spec=nvimgcodec.GRAY, apply_exif_orientation=False)
+    decode_params = nvimgcodec.DecodeParams(
+        allow_any_depth=True,
+        color_spec=nvimgcodec.GRAY,
+        apply_exif_orientation=False,
+        sample_format=nvimgcodec.SampleFormat.P_RGB
+    )
     assert (decode_params.apply_exif_orientation == False)
     assert (decode_params.allow_any_depth == True)
     assert (decode_params.color_spec == nvimgcodec.GRAY)
+    assert (decode_params.sample_format == nvimgcodec.P_RGB)
 
 def test_encode_params():
     # EncodeParams default constructor

@@ -17,6 +17,10 @@
 
 #pragma once
 
+#include <nvimgcodec.h>
+#include <nvtiff.h>
+#include <cstddef>
+#include <cstdint>
 #include "utils/library_version.h"
 
 namespace nvtiff {
@@ -25,5 +29,9 @@ using NvtiffVersion = nvimgcodec::LibraryVersion;
 
 // Get the current nvTIFF library version
 NvtiffVersion get_nvtiff_version();
+
+// Resolve the (image_idx | bitstream_offset) view selection to a concrete IFD byte offset.
+size_t resolve_ifd_selection(nvtiffStream_t nvtiff_stream, const nvimgcodecCodeStreamInfo_t& codestream_info);
+size_t resolve_ifd_selection(nvtiffStream_t nvtiff_stream, const nvimgcodecCodeStreamDesc_t* code_stream);
 
 }

@@ -17,12 +17,6 @@
 
 case "$1" in
     configure)
-        if [ ! -d /etc/ld.so.conf.d ]; then
-            mkdir -p /etc/ld.so.conf.d
-            touch /etc/ld.so.conf.d/.nvimgcodec_created
-        fi
-        ln -sf @CMAKE_INSTALL_PREFIX@/etc/ld.so.conf.d/@CPACK_PACKAGE_NAME@.conf /etc/ld.so.conf.d
-
         ldconfig
         ;;
 esac

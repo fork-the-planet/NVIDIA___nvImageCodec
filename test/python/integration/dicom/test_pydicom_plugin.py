@@ -16,10 +16,13 @@
 
 import logging
 import statistics
+import struct
 import sys
 import time
 from pathlib import Path
 from typing import Any, Iterator
+
+from utils import get_nvjpeg_ver
 
 import numpy as np
 import pytest
@@ -28,7 +31,9 @@ from PIL import Image as PILImage
 # Skip when optional codec stack is not installed (e.g. not installed on Windows with Python >=3.14)
 pytest.importorskip("pylibjpeg", reason="pylibjpeg required for pydicom plugin tests")
 from pydicom import dcmread
-from pydicom.data import get_testdata_files
+from pydicom.data import get_testdata_file
+from pydicom.dataset import FileDataset, FileMetaDataset
+from pydicom.uid import UID
 
 from nvidia.nvimgcodec.tools.dicom.pydicom_plugin import (
     SUPPORTED_DECODER_CLASSES,
@@ -37,12 +42,53 @@ from nvidia.nvimgcodec.tools.dicom.pydicom_plugin import (
     unregister,
 )
 
-# Files that fail to decode with any decoder
-_PROBLEMATIC_FILES_STEMS = [
-    "un_sequence",  # The dataset has no 'Pixel Data', 'Float Pixel Data' or 'Doub...
-    "jpeg2000-embedded-sequence-delimiter",  # Unable to decode as exceptions were raised by all available ...
-    "emri_small_jpeg_2k_lossless_too_short",  # The dataset has no 'Pixel Data', 'Float Pixel Data' or 'Doub...
-]
+_PYDICOM_DECODER_TEST_FILES = (
+    "693_J2KI.dcm",
+    "693_J2KR.dcm",
+    "GDCMJ2K_TextGBR.dcm",
+    "J2K_pixelrep_mismatch.dcm",
+    "JPEG-LL.dcm",
+    "JPEG2000.dcm",
+    "JPGLosslessP14SV1_1s_1f_8b.dcm",
+    "MR2_J2KI.dcm",
+    "MR2_J2KR.dcm",
+    "MR_small_jp2klossless.dcm",
+    "RG1_J2KI.dcm",
+    "RG1_J2KR.dcm",
+    "RG3_J2KI.dcm",
+    "RG3_J2KR.dcm",
+    "SC_jpeg_no_color_transform.dcm",
+    "SC_jpeg_no_color_transform_2.dcm",
+    "SC_rgb_dcmtk_+eb+cr.dcm",
+    "SC_rgb_dcmtk_+eb+cy+n1.dcm",
+    "SC_rgb_dcmtk_+eb+cy+n2.dcm",
+    "SC_rgb_dcmtk_+eb+cy+np.dcm",
+    "SC_rgb_dcmtk_+eb+cy+s2.dcm",
+    "SC_rgb_dcmtk_+eb+cy+s4.dcm",
+    "SC_rgb_gdcm_KY.dcm",
+    "SC_rgb_jpeg.dcm",
+    "SC_rgb_jpeg_app14_dcmd.dcm",
+    "SC_rgb_jpeg_dcmtk.dcm",
+    "SC_rgb_jpeg_gdcm.dcm",
+    "SC_rgb_jpeg_lossy_gdcm.dcm",
+    "SC_rgb_small_odd_jpeg.dcm",
+    "US1_J2KI.dcm",
+    "US1_J2KR.dcm",
+    "bad_sequence.dcm",
+    "color3d_jpeg_baseline.dcm",
+    "emri_small_jpeg_2k_lossless.dcm",
+    "examples_jpeg2k.dcm",
+    "examples_ybr_color.dcm",
+    "explicit_VR-UN.dcm",
+)
+
+_PYDICOM_PROBLEMATIC_TEST_FILES = (
+    "UN_sequence.dcm",
+    "JPEG2000-embedded-sequence-delimiter.dcm",
+    "emri_small_jpeg_2k_lossless_too_short.dcm",
+)
+
+_PROBLEMATIC_FILES_STEMS = {Path(name).stem.lower() for name in _PYDICOM_PROBLEMATIC_TEST_FILES}
 
 _logger = logging.getLogger(__name__)
 
@@ -165,6 +211,21 @@ def _save_frames_as_png(pixel_array: np.ndarray, output_dir: Path, file_stem: st
         image.save(filename)
 
 
+def _local_pydicom_dcm(filename: str) -> str | None:
+    """Return a local pydicom test-data file without triggering downloads."""
+    return get_testdata_file(filename, download=False)
+
+
+def _require_local_pydicom_dcm(filename: str) -> str:
+    path = _local_pydicom_dcm(filename)
+    if path is None:
+        pytest.fail(
+            f"Required pydicom test file {filename!r} is unavailable; "
+            "verify the pinned pydicom and pydicom-data packages"
+        )
+    return path
+
+
 def get_test_dicoms(folder_path: str | None = None):
     """Get testable DICOM files (supported transfer syntax, not problematic)."""
     if folder_path:
@@ -173,7 +234,11 @@ def get_test_dicoms(folder_path: str | None = None):
             raise FileNotFoundError(f"Folder not found: {folder_path}")
         dcm_paths = sorted(folder.glob("*.dcm"))
     else:
-        dcm_paths = [Path(x) for x in get_testdata_files("*.dcm")]
+        dcm_paths = [
+            Path(path)
+            for filename in _PYDICOM_DECODER_TEST_FILES
+            if (path := _local_pydicom_dcm(filename)) is not None
+        ]
 
     for path in dcm_paths:
         if path.stem.lower() in _PROBLEMATIC_FILES_STEMS:
@@ -186,17 +251,11 @@ def get_test_dicoms(folder_path: str | None = None):
             pass
 
 
-def _get_problematic_file_paths() -> list[str]:
-    """Get full paths for problematic files from pydicom test data."""
-    return [
-        str(p) for p in [Path(x) for x in get_testdata_files("*.dcm")]
-        if p.stem.lower() in _PROBLEMATIC_FILES_STEMS
-    ]
-
-
-@pytest.mark.parametrize("path", list(get_test_dicoms()))
-def test_nvimgcodec_decoder_matches_default(path: str) -> None:
+@pytest.mark.parametrize("filename", _PYDICOM_DECODER_TEST_FILES)
+def test_nvimgcodec_decoder_matches_default(filename: str) -> None:
     """Verify nvimgcodec decoder produces same output as default decoder."""
+    path = _require_local_pydicom_dcm(filename)
+
     # Decode with default decoder
     baseline_pixels = dcmread(path).pixel_array
     
@@ -263,9 +322,11 @@ def test_nvimgcodec_decoder_matches_default(path: str) -> None:
     )
 
 
-@pytest.mark.parametrize("path", _get_problematic_file_paths())
-def test_problematic_files_fail_with_all_decoders(path: str) -> None:
+@pytest.mark.parametrize("filename", _PYDICOM_PROBLEMATIC_TEST_FILES)
+def test_problematic_files_fail_with_all_decoders(filename: str) -> None:
     """Verify problematic files fail with both decoders."""
+    path = _require_local_pydicom_dcm(filename)
+
     # Baseline must fail
     with pytest.raises(Exception):
         dcmread(path).pixel_array
@@ -275,6 +336,208 @@ def test_problematic_files_fail_with_all_decoders(path: str) -> None:
         with pytest.raises(Exception):
             dcmread(path).pixel_array
 
+
+
+# ── Per-stream bug coverage of JPEG lossless marker handling ────────────────
+#
+# Prior to nvjpeg 13.0.2, the GPU parser failed to properly parse streams that contained
+# unexpected markers before the SOF3 (Start of Frame) segment. Notably, when
+# encountering a DHT (Define Huffman Table) or COM (Comment) marker before SOF3,
+# it would decode the image to an array of all zeros, silently producing invalid output.
+#
+# The tests below verify that our nvimgcodec integration now rejects these problematic
+# marker-ordering cases on old nvJPEG instead of returning zeroed output, while
+# preserving valid standard ordering such as SOF3-before-DHT P=12 streams.
+# The tested files/scenarios:
+#
+#   bad_sequence / Siemens  – P=16, SOI→SOF3→DHT→SOS   → nvimgcodec OK (valid)
+#   CSS P=12 stream        – P=12, SOI→SOF3→DHT→SOS   → nvimgcodec OK (valid)
+#   DHT before SOF3        – P=12, SOI→DHT→SOF3→SOS   → old nvJPEG rejects; fixed nvJPEG decodes
+#   COM before SOF3        – P=12, SOI→COM→SOF3→DHT→SOS → old nvJPEG rejects; fixed nvJPEG decodes
+#
+# Helper utilities and tests below construct each code path to ensure expected behavior.
+
+_RESOURCES_DIR = Path(__file__).parents[4] / "resources"
+_CSS_12BIT_JPEG = _RESOURCES_DIR / "jpeg/lossless/cat-3449999_640_grayscale_12bit.jpg"
+_LOSSLESS_JPEG_SV1_UID = UID("1.2.840.10008.1.2.4.70")
+
+
+def _get_pydicom_dcm(stem: str) -> str | None:
+    """Return the path to a pydicom test DICOM file by stem, or None if not found."""
+    return _local_pydicom_dcm(f"{stem}.dcm")
+
+
+def _sof3_dimensions(data: bytes) -> tuple[int, int]:
+    """Extract (rows, cols) from the first SOF3 marker in a JPEG byte stream."""
+    pos = 2  # past SOI
+    while pos + 3 < len(data):
+        if data[pos] != 0xFF:
+            break
+        pos += 1
+        while pos < len(data) and data[pos] == 0xFF:
+            pos += 1
+        marker = data[pos]
+        pos += 1
+        if marker in (0xD9, 0xDA):
+            break
+        if marker == 0xC3:  # SOF3: [len 2B][P 1B][rows 2B][cols 2B]...
+            rows = struct.unpack_from(">H", data, pos + 3)[0]
+            cols = struct.unpack_from(">H", data, pos + 5)[0]
+            return rows, cols
+        seg_len = struct.unpack_from(">H", data, pos)[0]
+        pos += seg_len
+    raise ValueError("SOF3 marker not found in JPEG stream")
+
+
+def _make_jpeg_lossless_dicom(jpeg_bytes: bytes, bits_stored: int) -> FileDataset:
+    """Wrap raw JPEG lossless bytes in a minimal DICOM FileDataset."""
+    rows, cols = _sof3_dimensions(jpeg_bytes)
+
+    file_meta = FileMetaDataset()
+    file_meta.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.4"
+    file_meta.MediaStorageSOPInstanceUID = "1.2.3.4.5.6"
+    file_meta.TransferSyntaxUID = _LOSSLESS_JPEG_SV1_UID
+
+    import pydicom.encaps
+    ds = FileDataset(None, {}, file_meta=file_meta, preamble=b"\x00" * 128)
+    ds.is_implicit_VR = False
+    ds.is_little_endian = True
+    ds.SOPClassUID = "1.2.840.10008.5.1.4.1.1.4"
+    ds.SOPInstanceUID = "1.2.3.4.5.6"
+    ds.Rows = rows
+    ds.Columns = cols
+    ds.BitsAllocated = 16
+    ds.BitsStored = bits_stored
+    ds.HighBit = bits_stored - 1
+    ds.PixelRepresentation = 0
+    ds.SamplesPerPixel = 1
+    ds.PhotometricInterpretation = "MONOCHROME2"
+    ds.PixelData = pydicom.encaps.encapsulate([jpeg_bytes])
+    return ds
+
+
+def _jpeg_parse_segments(data: bytes) -> list[tuple[int, bytes]]:
+    """Parse a JPEG byte stream into a list of (marker, raw_bytes) pairs.
+    Each raw_bytes includes the 0xFF marker byte and length field (where applicable).
+    The compressed scan data after SOS is stored under marker 0x00."""
+    segs = []
+    pos = 2  # past SOI
+    while pos < len(data):
+        assert data[pos] == 0xFF, f"expected 0xFF at offset {pos}"
+        marker = data[pos + 1]
+        if marker == 0xD9:  # EOI
+            segs.append((0xD9, b"\xff\xd9"))
+            break
+        if marker == 0xDA:  # SOS: rest of file is SOS header + compressed bitstream
+            seg_len = struct.unpack_from(">H", data, pos + 2)[0]
+            segs.append((0xDA, data[pos : pos + 2 + seg_len]))
+            segs.append((0x00, data[pos + 2 + seg_len :]))  # bitstream + EOI
+            break
+        seg_len = struct.unpack_from(">H", data, pos + 2)[0]
+        segs.append((marker, data[pos : pos + 2 + seg_len]))
+        pos += 2 + seg_len
+    return segs
+
+
+def _jpeg_rearrange_dht_before_sof3(jpeg_bytes: bytes) -> bytes:
+    """Return a copy of jpeg_bytes with the DHT segment moved before SOF3."""
+    segs = _jpeg_parse_segments(jpeg_bytes)
+    dht_i = next(i for i, (m, _) in enumerate(segs) if m == 0xC4)
+    sof3_i = next(i for i, (m, _) in enumerate(segs) if m == 0xC3)
+    if dht_i > sof3_i:
+        dht = segs.pop(dht_i)
+        segs.insert(sof3_i, dht)
+    return b"\xff\xd8" + b"".join(d for _, d in segs)
+
+
+def _jpeg_insert_com_before_sof3(jpeg_bytes: bytes) -> bytes:
+    """Return a copy of jpeg_bytes with a COMMENT segment inserted before SOF3."""
+    comment = b"test"
+    seg_len = 2 + len(comment)
+    com_seg = bytes([0xFF, 0xFE, seg_len >> 8, seg_len & 0xFF]) + comment
+    segs = _jpeg_parse_segments(jpeg_bytes)
+    sof3_i = next(i for i, (m, _) in enumerate(segs) if m == 0xC3)
+    segs.insert(sof3_i, (0xFE, com_seg))
+    return b"\xff\xd8" + b"".join(d for _, d in segs)
+
+
+def _assert_nvimgcodec_matches_default_pydicom(path: str) -> None:
+    baseline_pixels = dcmread(path).pixel_array
+    with NvimgcodecPlugin():
+        nvimgcodec_pixels = dcmread(path).pixel_array
+    np.testing.assert_array_equal(nvimgcodec_pixels, baseline_pixels)
+
+
+def test_lossless_p16_standard_decodes_correctly():
+    """
+    Siemens-style: BitsStored=12 in the DICOM tag but SOF3 P=16 with standard
+    marker ordering (no unexpected marker before SOF3). nvimgcodec should decode
+    exactly like native pydicom decoders, confirming the valid case works.
+    """
+    path = _get_pydicom_dcm("bad_sequence")
+    assert path is not None, "bad_sequence.dcm not found in pydicom test data"
+    _assert_nvimgcodec_matches_default_pydicom(path)
+
+
+def test_lossless_p12_decodes_correctly(tmp_path):
+    """
+    SOF3 P=12 must decode exactly like native pydicom decoders.
+    nvimgcodec handles arbitrary bit depths; rejection is not acceptable.
+    """
+    assert _CSS_12BIT_JPEG.exists(), f"CSS 12-bit test resource not found: {_CSS_12BIT_JPEG}"
+    jpeg_bytes = _CSS_12BIT_JPEG.read_bytes()
+    ds = _make_jpeg_lossless_dicom(jpeg_bytes, bits_stored=12)
+    dcm_path = tmp_path / "p12_mr_style.dcm"
+    ds.save_as(str(dcm_path))
+    _assert_nvimgcodec_matches_default_pydicom(str(dcm_path))
+
+
+def test_lossless_dht_before_sof3(tmp_path):
+    """
+    Philips CT-style — DHT marker before SOF3, using the real CSS 12-bit JPEG with
+    DHT and SOF3 segments swapped.
+    - nvJPEG < 13.0.2: HasProblematicMarkerBeforeSof3 returns CODESTREAM_UNSUPPORTED -> exception.
+    - nvJPEG >= 13.0.2: both CPU and GPU parsers handle DHT-before-SOF3 → non-zero pixels.
+    """
+    assert _CSS_12BIT_JPEG.exists(), f"CSS 12-bit test resource not found: {_CSS_12BIT_JPEG}"
+    jpeg_bytes = _jpeg_rearrange_dht_before_sof3(_CSS_12BIT_JPEG.read_bytes())
+    ds = _make_jpeg_lossless_dicom(jpeg_bytes, bits_stored=12)
+    dcm_path = tmp_path / "dht_before_sof3.dcm"
+    ds.save_as(str(dcm_path))
+
+    baseline_pixels = dcmread(str(dcm_path)).pixel_array
+    assert baseline_pixels.max() > 0, "DHT-before-SOF3: native pydicom decoder returned all-zero output"
+    with NvimgcodecPlugin():
+        if get_nvjpeg_ver() >= (13, 0, 2):
+            pixels = dcmread(str(dcm_path)).pixel_array
+            np.testing.assert_array_equal(pixels, baseline_pixels)
+        else:
+            with pytest.raises(Exception):
+                dcmread(str(dcm_path)).pixel_array
+
+
+def test_lossless_com_before_sof3(tmp_path):
+    """
+    COM marker before SOF3, using the real CSS 12-bit JPEG with a COMMENT segment
+    inserted before SOF3.
+    - nvJPEG < 13.0.2: HasProblematicMarkerBeforeSof3 returns CODESTREAM_UNSUPPORTED -> exception.
+    - nvJPEG >= 13.0.2: GPU kernel handles COMMENT markers → non-zero pixels.
+    """
+    assert _CSS_12BIT_JPEG.exists(), f"CSS 12-bit test resource not found: {_CSS_12BIT_JPEG}"
+    jpeg_bytes = _jpeg_insert_com_before_sof3(_CSS_12BIT_JPEG.read_bytes())
+    ds = _make_jpeg_lossless_dicom(jpeg_bytes, bits_stored=12)
+    dcm_path = tmp_path / "com_before_sof3.dcm"
+    ds.save_as(str(dcm_path))
+
+    baseline_pixels = dcmread(str(dcm_path)).pixel_array
+    assert baseline_pixels.max() > 0, "COM-before-SOF3: native pydicom decoder returned all-zero output"
+    with NvimgcodecPlugin():
+        if get_nvjpeg_ver() >= (13, 0, 2):
+            pixels = dcmread(str(dcm_path)).pixel_array
+            np.testing.assert_array_equal(pixels, baseline_pixels)
+        else:
+            with pytest.raises(Exception):
+                dcmread(str(dcm_path)).pixel_array
 
 
 def performance_test_nvimgcodec_decoder_against_defaults(

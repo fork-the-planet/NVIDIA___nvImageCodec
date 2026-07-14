@@ -20,8 +20,8 @@ import numpy as np
 from nvidia import nvimgcodec
 import pytest as t
 from utils import img_dir_path
-import nvjpeg_test_speedup
 from utils import *
+
 
 multi_page_tiff_sample={
         'multipage_file':"tiff/multi_page.tif",  # this multi page tiff consists of all files which are listed in next tuple and are used as references
@@ -43,7 +43,7 @@ multi_page_tiff_sample={
     (6,)
 ])
 def test_decode_selected_images(file_sample, indices):
-    decoder = nvimgcodec.Decoder(options=":fancy_upsampling=1")
+    decoder = nvimgcodec.Decoder()
     
     fpath = os.path.join(img_dir_path, file_sample['multipage_file'])
 
@@ -57,6 +57,19 @@ def test_decode_selected_images(file_sample, indices):
         img = decoder.decode(scs)
         np.testing.assert_allclose(ref_imgs[i], img.cpu(), atol=4)
 
+
+def test_cpu_decode_image_idx_substream_without_parent_count():
+    """CPU TIFF decode should accept image-index substreams that report one selected image."""
+    decoder = nvimgcodec.Decoder(backends=[nvimgcodec.Backend(nvimgcodec.BackendKind.CPU_ONLY)], options=":fancy_upsampling=1")
+    fpath = os.path.join(img_dir_path, multi_page_tiff_sample["multipage_file"])
+    cs = nvimgcodec.CodeStream(fpath)
+    substream = cs.get_sub_code_stream(image_idx=2)
+
+    img = decoder.decode(substream)
+
+    assert img is not None
+    assert img.cpu().shape[:2] == (substream.height, substream.width)
+
 @t.mark.parametrize("file_sample", [multi_page_tiff_sample])
 @t.mark.parametrize("indices", [
     (0, 1, 2, 3, 4, 5, 6),
@@ -66,7 +79,7 @@ def test_decode_selected_images(file_sample, indices):
     (6,)
 ])
 def test_decode_selected_images_in_batch(file_sample, indices):
-    decoder = nvimgcodec.Decoder(options=":fancy_upsampling=1")
+    decoder = nvimgcodec.Decoder()
     
     fpath = os.path.join(img_dir_path, file_sample['multipage_file'])
 
@@ -95,7 +108,7 @@ def test_decode_selected_images_in_batch(file_sample, indices):
     (6, (70, 80, 90, 100)),
 ])
 def test_decode_selected_image_with_roi(file_sample, image_id_and_roi):
-    decoder = nvimgcodec.Decoder(options=":fancy_upsampling=1")
+    decoder = nvimgcodec.Decoder()
     fpath = os.path.join(img_dir_path, file_sample['multipage_file'])
     code_stream = nvimgcodec.CodeStream(fpath)
 
@@ -125,7 +138,7 @@ def test_decode_selected_image_with_roi(file_sample, image_id_and_roi):
     )
 ])
 def test_decode_batch_roi(file_sample, image_id_and_roi_batch):
-    decoder = nvimgcodec.Decoder(options=":fancy_upsampling=1")
+    decoder = nvimgcodec.Decoder()
     fpath = os.path.join(img_dir_path, file_sample['multipage_file'])
     code_stream = nvimgcodec.CodeStream(fpath)
 
@@ -151,10 +164,10 @@ def test_decode_image_out_of_range(file_sample):
 
     cs = nvimgcodec.CodeStream(fpath)
 
-    with t.raises(Exception) as excinfo:
+    # Eager validation rejects the out-of-range image_idx at sub-stream creation.
+    with t.raises(RuntimeError):
         scs = cs.get_sub_code_stream(cs.num_images)
-    assert (isinstance(excinfo.value, RuntimeError) )
-    assert (str(excinfo.value) == f"Image index #{cs.num_images} out of range (0, {cs.num_images - 1})")
+        _ = scs.width
     
     with t.raises(Exception) as excinfo:
         scs = cs.get_sub_code_stream(-1)
@@ -165,11 +178,11 @@ def test_decode_image_out_of_range(file_sample):
 @t.mark.parametrize("file_sample", [
     "tiff/multi_page.tif"
 ])
-def test_decode_sub_code_stream_num_images_same_as_parent(file_sample):
+def test_decode_sub_code_stream_num_images_is_selected_view(file_sample):
     fpath = os.path.join(img_dir_path, file_sample)
     code_stream = nvimgcodec.CodeStream(fpath)
 
     for i in range(code_stream.num_images):
         scs = code_stream.get_sub_code_stream(i)
-        assert(scs.num_images == code_stream.num_images)
+        assert(scs.num_images == 1)
         

@@ -132,10 +132,24 @@ public:
 };
 
 
-TEST_P(OpenCVExtTest, ValidFormatAndParameters)
-{
-    TestEncodeDecodeSingleImage(codec_name, std::get<6>(GetParam()));
-}
+// Emit three encode/decode test cases for an OpenCVExtTest-shaped fixture (one
+// per input plane-stride layout), so each layout is a distinct gtest case -
+// mirroring the decoder DEFINE_SINGLE_IMAGE_STRIDE_TESTS macro.
+#define DEFINE_ENCODE_DECODE_STRIDE_TESTS(FIXTURE, ADD_ALPHA)                                             \
+    TEST_P(FIXTURE, ValidFormatAndParametersStrideContiguous)                                             \
+    {                                                                                                     \
+        TestEncodeDecodeSingleImage(codec_name, std::get<6>(GetParam()), ADD_ALPHA, StrideMode::Contiguous); \
+    }                                                                                                     \
+    TEST_P(FIXTURE, ValidFormatAndParametersStrideSamePadAllPlanes)                                       \
+    {                                                                                                     \
+        TestEncodeDecodeSingleImage(codec_name, std::get<6>(GetParam()), ADD_ALPHA, StrideMode::SamePadAllPlanes); \
+    }                                                                                                     \
+    TEST_P(FIXTURE, ValidFormatAndParametersStrideDiffPadPerPlane)                                        \
+    {                                                                                                     \
+        TestEncodeDecodeSingleImage(codec_name, std::get<6>(GetParam()), ADD_ALPHA, StrideMode::DiffPadPerPlane); \
+    }
+
+DEFINE_ENCODE_DECODE_STRIDE_TESTS(OpenCVExtTest, false)
 
 INSTANTIATE_TEST_SUITE_P(ENCODE_DECODE_SIMILAR_WITH_VARIOUS_FORMATS, OpenCVExtTest,
     Combine(
@@ -230,10 +244,7 @@ INSTANTIATE_TEST_SUITE_P(ENCODE_DECODE_SIZE_RATIO, OpenCVExtTest,
 class OpenCVExtTestWithAlpha: public OpenCVExtTest
 {};
 
-TEST_P(OpenCVExtTestWithAlpha, ValidFormatAndParameters)
-{
-    TestEncodeDecodeSingleImage(codec_name, std::get<6>(GetParam()), true);
-}
+DEFINE_ENCODE_DECODE_STRIDE_TESTS(OpenCVExtTestWithAlpha, true)
 // bmp does not support 4 channel decoding, so encoding will be skipped
 
 INSTANTIATE_TEST_SUITE_P(ENCODE_DECODE_SIMILAR_WITH_VARIOUS_FORMATS, OpenCVExtTestWithAlpha,

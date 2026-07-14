@@ -55,6 +55,7 @@ CodeStream::CodeStream(const CodeStream& other, const nvimgcodecCodeStreamView_t
     , code_stream_desc_{NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_DESC, sizeof(nvimgcodecCodeStreamDesc_t), nullptr, this, &io_stream_desc_,
           static_get_codestream_info, static_get_image_info}
     , parse_status_{NVIMGCODEC_STATUS_NOT_INITIALIZED}
+    , image_info_status_{NVIMGCODEC_STATUS_NOT_INITIALIZED}
     , code_stream_view_(code_stream_view)
     , codestream_info_{NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_INFO, sizeof(nvimgcodecCodeStreamInfo_t), nullptr, &code_stream_view_, ""}
     , codestream_info_tiff_ext_{NVIMGCODEC_STRUCTURE_TYPE_TIFF_CODE_STREAM_INFO, sizeof(nvimgcodecCodeStreamInfoTiffExt_t), nullptr, 0}
@@ -62,24 +63,53 @@ CodeStream::CodeStream(const CodeStream& other, const nvimgcodecCodeStreamView_t
     , jpeg_info_{NVIMGCODEC_STRUCTURE_TYPE_JPEG_IMAGE_INFO, sizeof(nvimgcodecJpegImageInfo_t), &tile_geometry_info_}
     , image_info_{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), &jpeg_info_}
 {
-    // Inherit bitstream_offset from parent if the new view doesn't specify one.
-    // This allows iterating through images in a sub-code stream created with a specific offset.
-    if (code_stream_view_.bitstream_offset == 0 && other.codestream_info_.code_stream_view) {
-        if (other.codestream_info_.code_stream_view->bitstream_offset != 0) {
-            code_stream_view_.bitstream_offset = other.codestream_info_.code_stream_view->bitstream_offset;
+    const auto* parent_view = other.codestream_info_.code_stream_view;
+    const bool parent_region = parent_view && parent_view->region.ndim != 0;
+
+    code_stream_view_.struct_next = nullptr;
+    code_stream_view_.region.struct_next = nullptr;
+
+    if (parent_region) {
+        throw Exception(INVALID_PARAMETER, "Cannot create a sub code stream with nested regions. This is not supported.", "CodeStream::CodeStream");
+    }
+    if (parent_view && code_stream_view.image_idx != 0) {
+        throw Exception(INVALID_PARAMETER, "Cannot apply nonzero image_idx to a sub code stream.",
+            "CodeStream::CodeStream");
+    }
+
+    // Default child views preserve the parent's selected image. Explicit
+    // bitstream_offset still overrides the parent selection.
+    if (code_stream_view_.bitstream_offset == 0 && parent_view) {
+        if (parent_view->bitstream_offset != 0) {
+            code_stream_view_.bitstream_offset = parent_view->bitstream_offset;
+        } else if (code_stream_view_.image_idx == 0) {
+            code_stream_view_.image_idx = parent_view->image_idx;
         }
+    }
+
+    if (code_stream_view_.bitstream_offset != 0 && code_stream_view_.image_idx != 0) {
+        throw Exception(INVALID_PARAMETER, "image_idx cannot be combined with bitstream_offset for code stream views",
+            "CodeStream::CodeStream");
     }
 
     // Link codestream info extension
     codestream_info_.struct_next = &codestream_info_tiff_ext_;
 
-    // If it's only one image and no offset/limit pagination is used, we can reuse the information from the original parsed info.
-    // When bitstream_offset is specified, we must re-parse since we're accessing a different IFD (e.g., SubIFD).
-    // When limit_images is specified, we must re-parse to get correct num_images for the limited view.
-    if (other.parse_status_ == NVIMGCODEC_STATUS_SUCCESS && other.codestream_info_.num_images == 1 && code_stream_view.image_idx == 0 &&
-        code_stream_view_.bitstream_offset == 0 && code_stream_view_.limit_images == 0
-    ) {
+    // Reuse parsed metadata only when the child changes ROI but keeps the same
+    // selected image. Container-specific selection stays in the parser cache.
+    const size_t parent_image_idx = parent_view ? parent_view->image_idx : 0;
+    const size_t parent_bitstream_offset = parent_view ? parent_view->bitstream_offset : 0;
+    const bool selects_same_image =
+        code_stream_view_.image_idx == parent_image_idx &&
+        code_stream_view_.bitstream_offset == parent_bitstream_offset;
+    const bool can_reuse_parsed_info =
+        other.parse_status_ == NVIMGCODEC_STATUS_SUCCESS &&
+        other.image_info_status_ == NVIMGCODEC_STATUS_SUCCESS &&
+        other.codestream_info_.num_images == 1 &&
+        selects_same_image;
+    if (can_reuse_parsed_info) {
         parse_status_ = other.parse_status_;
+        image_info_status_ = other.image_info_status_;
         codestream_info_ = other.codestream_info_;
         codestream_info_tiff_ext_ = other.codestream_info_tiff_ext_;
         tile_geometry_info_ = other.tile_geometry_info_;
@@ -89,10 +119,6 @@ CodeStream::CodeStream(const CodeStream& other, const nvimgcodecCodeStreamView_t
         codestream_info_.struct_next = &codestream_info_tiff_ext_;
         image_info_.struct_next = &jpeg_info_;
         jpeg_info_.struct_next = &tile_geometry_info_;
-    }
-
-    if (other.codestream_info_.code_stream_view && other.codestream_info_.code_stream_view->region.ndim != 0 && code_stream_view.region.ndim != 0) {
-        throw Exception(INVALID_PARAMETER, "Cannot create a sub code stream with nested regions. This is not supported.", "CodeStream::CodeStream");
     }
 }
 
@@ -110,6 +136,7 @@ void CodeStream::moveImpl(CodeStream&& other)
     code_stream_desc_ = {NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_DESC, sizeof(nvimgcodecCodeStreamDesc_t), nullptr, this, &io_stream_desc_,
         static_get_codestream_info, static_get_image_info};
     parse_status_ = other.parse_status_;
+    image_info_status_ = other.image_info_status_;
     code_stream_view_ = other.code_stream_view_;
     codestream_info_ = other.codestream_info_;
     codestream_info_tiff_ext_ = other.codestream_info_tiff_ext_;
@@ -157,13 +184,16 @@ void CodeStream::parseFromFile(const std::string& file_name)
 {
     assert(io_stream_factory_);
     io_stream_ = io_stream_factory_->createFileIoStream(file_name, false, true, false);
+    try { getParser(); } catch (...) {} // share one parser/cache across sub streams
 }
 
 void CodeStream::parseFromMem(const unsigned char* data, size_t size)
 {
     assert(io_stream_factory_);
     io_stream_ = io_stream_factory_->createMemIoStream(data, size);
+    try { getParser(); } catch (...) {}  // share one parser/cache across sub streams
 }
+
 void CodeStream::setOutputToFile(const char* file_name)
 {
     assert(io_stream_factory_);
@@ -178,14 +208,13 @@ void CodeStream::setOutputToHostMem(void* ctx, nvimgcodecResizeBufferFunc_t resi
 
 void CodeStream::setCodeStreamView(const nvimgcodecCodeStreamView_t* view)
 {
-    if (!view) {
+    // Creation views only seed an absolute bitstream offset. Image and region
+    // selection is represented by sub-code streams.
+    if (!view || view->bitstream_offset == 0) {
         return;
     }
 
     code_stream_view_.bitstream_offset = view->bitstream_offset;
-    code_stream_view_.limit_images = view->limit_images;
-
-    // Ensure the view is set in codestream_info
     codestream_info_.code_stream_view = &code_stream_view_;
     codestream_info_.struct_next = &codestream_info_tiff_ext_;
 }
@@ -198,14 +227,25 @@ void copy(T& dst, const T& src)
     dst.struct_next = struct_next;
 }
 
-nvimgcodecStatus_t CodeStream::ensureParsed()
+nvimgcodecStatus_t CodeStream::ensureCodeStreamInfoParsed()
 {
     if (parse_status_ == NVIMGCODEC_STATUS_NOT_INITIALIZED) {
         IImageParser* parser = getParser();
         if (parser) {
             parse_status_ = parser->getCodeStreamInfo(&code_stream_desc_, &codestream_info_);
             if (parse_status_ == NVIMGCODEC_STATUS_SUCCESS) {
-                parse_status_ = parser->getImageInfo(&code_stream_desc_, &image_info_);
+                // TIFF image_idx views are resolved by the parser to a concrete
+                // IFD and intentionally exposed as a single-image code stream.
+                const bool has_resolved_tiff_ifd_view =
+                    codestream_info_.code_stream_view && codestream_info_tiff_ext_.ifd_offset != 0;
+                if (codestream_info_.code_stream_view &&
+                    codestream_info_.code_stream_view->image_idx >= codestream_info_.num_images &&
+                    !has_resolved_tiff_ifd_view) {
+                    NVIMGCODEC_LOG_ERROR(Logger::get_default(), "Image index #" << codestream_info_.code_stream_view->image_idx
+                        << " out of range (0, " << (codestream_info_.num_images == 0 ? 0 : codestream_info_.num_images - 1) << ")");
+                    parse_status_ = NVIMGCODEC_STATUS_INVALID_PARAMETER;
+                    return parse_status_;
+                }
             }
         } else {
             return NVIMGCODEC_STATUS_CODESTREAM_UNSUPPORTED;
@@ -214,15 +254,49 @@ nvimgcodecStatus_t CodeStream::ensureParsed()
     return parse_status_;
 }
 
+nvimgcodecStatus_t CodeStream::ensureParsed()
+{
+    if (image_info_status_ == NVIMGCODEC_STATUS_NOT_INITIALIZED && !codestream_info_.code_stream_view &&
+        parse_status_ == NVIMGCODEC_STATUS_NOT_INITIALIZED) {
+        IImageParser* parser = getParser();
+        if (parser && parser->getCodecName() == "tiff") {
+            nvimgcodecCodeStreamView_t first_image_view{
+                NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_VIEW, sizeof(nvimgcodecCodeStreamView_t), nullptr, 0, {}, 0};
+            CodeStream first_image_stream(*this, first_image_view);
+            image_info_status_ = first_image_stream.ensureParsed();
+            if (image_info_status_ != NVIMGCODEC_STATUS_SUCCESS) {
+                return image_info_status_;
+            }
+
+            copy(tile_geometry_info_, first_image_stream.tile_geometry_info_);
+            copy(jpeg_info_, first_image_stream.jpeg_info_);
+            copy(image_info_, first_image_stream.image_info_);
+            return image_info_status_;
+        }
+    }
+
+    auto status = ensureCodeStreamInfoParsed();
+    if (status != NVIMGCODEC_STATUS_SUCCESS) {
+        return status;
+    }
+
+    if (image_info_status_ == NVIMGCODEC_STATUS_NOT_INITIALIZED) {
+        IImageParser* parser = getParser();
+        image_info_status_ = parser->getImageInfo(&code_stream_desc_, &image_info_);
+    }
+    return image_info_status_;
+}
+
 nvimgcodecStatus_t CodeStream::getCodeStreamInfo(nvimgcodecCodeStreamInfo_t* codestream_info)
 {
     assert(codestream_info);
 
-    if (ensureParsed() != NVIMGCODEC_STATUS_SUCCESS) {
+    if (ensureCodeStreamInfoParsed() != NVIMGCODEC_STATUS_SUCCESS) {
         return parse_status_;
     }
 
-    // For encoder-created streams, size was set to 0 in setImageInfo; fill from stream when available
+    // Fill size from the backing stream when the parser left it unset (e.g. encoder-created
+    // streams). Sub-code-streams share the parent's io_stream_ and inherit the same backing size.
     if (codestream_info_.size == 0 && io_stream_) {
         codestream_info_.size = io_stream_->size();
     }
@@ -254,8 +328,9 @@ nvimgcodecStatus_t CodeStream::getImageInfo(nvimgcodecImageInfo_t* image_info)
 {
     assert(image_info);
 
-    if (ensureParsed() != NVIMGCODEC_STATUS_SUCCESS) {
-        return parse_status_;
+    auto status = ensureParsed();
+    if (status != NVIMGCODEC_STATUS_SUCCESS) {
+        return status;
     }
 
     void* struct_next = image_info->struct_next;
@@ -312,12 +387,13 @@ nvimgcodecStatus_t CodeStream::setImageInfo(const nvimgcodecImageInfo_t* image_i
     }
     codestream_info_.size = 0;  // Updated in getCodeStreamInfo from io_stream_ when available
     parse_status_ = NVIMGCODEC_STATUS_SUCCESS;
+    image_info_status_ = NVIMGCODEC_STATUS_SUCCESS;
     return NVIMGCODEC_STATUS_SUCCESS;
 }
 
 std::string CodeStream::getCodecName() const
 {
-    if (parse_status_ == NVIMGCODEC_STATUS_SUCCESS) {
+    if (image_info_status_ == NVIMGCODEC_STATUS_SUCCESS) {
         return std::string(image_info_.codec_name);
     } else {
         IImageParser* parser = const_cast<CodeStream*>(this)->getParser();

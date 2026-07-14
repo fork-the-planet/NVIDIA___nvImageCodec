@@ -17,11 +17,39 @@ import os
 import pytest as t
 import hashlib
 import subprocess
+import glob
 
 
 img_dir_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../resources"))
-exec_dir_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../bin"))
-transcode_exec="nvimtrans"
+transcode_exec = "nvimtrans.exe" if os.name == "nt" else "nvimtrans"
+
+
+def find_nvimtrans_dir():
+    install_root = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+    bin_dir = os.path.join(install_root, "bin")
+    cuda_major = os.getenv("CUDA_VERSION_MAJOR")
+    versioned_bin_root = bin_dir if os.name == "nt" else os.path.join(bin_dir, "nvimgcodec")
+
+    if cuda_major:
+        versioned_bin_dir = os.path.join(versioned_bin_root, cuda_major)
+        if os.path.isfile(os.path.join(versioned_bin_dir, transcode_exec)):
+            return versioned_bin_dir
+        raise FileNotFoundError(f"{transcode_exec} not found for CUDA {cuda_major} in: {versioned_bin_dir}")
+
+    versioned_bin_dirs = [
+        path for path in sorted(glob.glob(os.path.join(versioned_bin_root, "*")))
+        if os.path.isfile(os.path.join(path, transcode_exec))
+    ]
+    if len(versioned_bin_dirs) == 1:
+        return versioned_bin_dirs[0]
+    if len(versioned_bin_dirs) > 1:
+        raise RuntimeError(f"CUDA_VERSION_MAJOR is required when multiple {transcode_exec} variants exist: {versioned_bin_dirs}")
+
+    if os.path.isfile(os.path.join(bin_dir, transcode_exec)):
+        return bin_dir
+
+    raise FileNotFoundError(f"{transcode_exec} not found in: {versioned_bin_root} or {bin_dir}")
+
 
 def file_md5(file_name):
     hash_md5 = hashlib.md5()
@@ -64,6 +92,7 @@ def imtrans_test(tmp_path, input_img_file, codec, output_img_file, params, check
         # if check_sum is not in the map (meaning it is the same for cuda 12 and 13) just keep the value unchanged
         check_sum = cuda13_checksum_map.get(check_sum, check_sum)
 
+    exec_dir_path = find_nvimtrans_dir()
     os.chdir(exec_dir_path)
     input_img_path = os.path.join(img_dir_path, input_img_file)
     output_img_path = os.path.join(tmp_path, output_img_file)
@@ -165,4 +194,3 @@ def test_imtrans_common_lossless(tmp_path, input_img_file, codec, output_img_fil
 )
 def test_imtrans_encoding_to_jpeg_cuda12_and_above(tmp_path, input_img_file, codec, output_img_file, params, check_sum):
     imtrans_test(tmp_path, input_img_file, codec, output_img_file, params, check_sum)
-    

@@ -35,6 +35,8 @@
 #include "imgproc/convert_kernel_gpu.h"
 #include "imgproc/device_buffer.h"
 #include "imgproc/out_of_bound_roi_fill.h"
+#include "imgproc/region_orientation.h"
+#include "imgproc/image_info_checks.h"
 #include "imgproc/type_utils.h"
 
 #define DEFAULT_GPU_HYBRID_HUFFMAN_THRESHOLD 1000u * 1000u
@@ -157,6 +159,10 @@ struct Decoder
     NvjpegVersion nvjpeg_version_;
     size_t gpu_hybrid_huffman_threshold_ = DEFAULT_GPU_HYBRID_HUFFMAN_THRESHOLD;
     bool preallocate_buffers_ = true;
+    // Default true: matches libjpeg's chroma upsampling behaviour.
+    bool fancy_upsampling_ = true;
+    bool enable_roi_fancy_upsampling_ = true;
+    unsigned int nvjpeg_extra_flags_ = 0;
     std::optional<size_t> device_mem_padding_;
     std::optional<size_t> pinned_mem_padding_;
 };
@@ -177,6 +183,7 @@ nvimgcodecDecoderDesc_t* NvJpegCudaDecoderPlugin::getDecoderDesc()
 void Decoder::parseOptions(const char* options)
 {
     gpu_hybrid_huffman_threshold_ = DEFAULT_GPU_HYBRID_HUFFMAN_THRESHOLD;
+    enable_roi_fancy_upsampling_ = nvjpeg_version_ >= ROI_FANCY_UPSAMPLING_FIX_VERSION;
     std::istringstream iss(options ? options : "");
     std::string token;
     while (std::getline(iss, token, ' ')) {
@@ -203,6 +210,12 @@ void Decoder::parseOptions(const char* options)
             pinned_mem_padding_ = padding_value;
         } else if (option == "preallocate_buffers") {
             value >> preallocate_buffers_;
+        } else if (option == "fancy_upsampling") {
+            value >> fancy_upsampling_;
+        } else if (option == "enable_roi_fancy_upsampling") {
+            value >> enable_roi_fancy_upsampling_;
+        } else if (option == "extra_flags") {
+            value >> nvjpeg_extra_flags_;
         }
     }
 }
@@ -251,7 +264,11 @@ Decoder::Decoder(
             device_allocator_.dev_malloc && device_allocator_.dev_free && pinned_allocator_.pinned_malloc && pinned_allocator_.pinned_free;
     }
 
-    unsigned int nvjpeg_flags = get_nvjpeg_flags("nvjpeg_cuda_decoder", nvjpeg_version_, options);
+    unsigned int nvjpeg_flags = get_nvjpeg_flags(nvjpeg_version_, fancy_upsampling_, nvjpeg_extra_flags_);
+
+    if (fancy_upsampling_) {
+        NVIMGCODEC_LOG_INFO(framework_, plugin_id_, "Fancy upsampling enabled; performance may be worse compared to simple upsampling");
+    }
 
     if (use_nvjpeg_create_ex_v2) {
         XM_CHECK_NVJPEG(nvjpegCreateExV2(NVJPEG_BACKEND_DEFAULT, &device_allocator_, &pinned_allocator_, nvjpeg_flags, &handle_));
@@ -481,6 +498,9 @@ nvimgcodecProcessingStatus_t Decoder::canDecode(
                 status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
             }
         }
+        if (!nvimgcodec::check_planes_consistency(framework_, plugin_id_, image_info)) {
+            status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
+        }
 
         nvimgcodecCodeStreamInfo_t codestream_info{NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_INFO, sizeof(nvimgcodecCodeStreamInfo_t), nullptr};
         ret = code_stream->getCodeStreamInfo(code_stream->instance, &codestream_info);
@@ -496,7 +516,17 @@ nvimgcodecProcessingStatus_t Decoder::canDecode(
             if (region.ndim == 0) {
                 // no ROI, okay
             } else if (region.ndim == 2) {
-                if (nvimgcodec::is_region_out_of_bounds(region, cs_image_info.plane_info[0].width, cs_image_info.plane_info[0].height)) {
+                if (fancy_upsampling_ && !enable_roi_fancy_upsampling_ &&
+                    cs_image_info.chroma_subsampling != NVIMGCODEC_SAMPLING_444 &&
+                    cs_image_info.chroma_subsampling != NVIMGCODEC_SAMPLING_GRAY) {
+                    NVIMGCODEC_LOG_WARNING(framework_, plugin_id_,
+                        "ROI decode with fancy upsampling may produce wrong results on image edge (1 pixel wide) with nvJPEG < 13.2 (available in CTK 13.3)."
+                        " To enable anyway, set enable_roi_fancy_upsampling=1");
+                    status |= NVIMGCODEC_PROCESSING_STATUS_ROI_UNSUPPORTED;
+                }
+                if (nvimgcodec::is_region_out_of_bounds_effective(region, image_info.orientation,
+                        cs_image_info.plane_info[0].width, cs_image_info.plane_info[0].height,
+                        params->apply_exif_orientation)) {
                     if (auto err_message = nvimgcodec::verify_region_fill_support(region, image_info); !err_message.empty()) {
                         status |= NVIMGCODEC_PROCESSING_STATUS_ROI_UNSUPPORTED;
                         NVIMGCODEC_LOG_WARNING(framework_, plugin_id_, err_message);
@@ -610,15 +640,24 @@ nvimgcodecStatus_t Decoder::decode(const nvimgcodecImageDesc_t* image, const nvi
         bool has_oob_roi = false;
 
         if (codestream_info.code_stream_view) {
+            // nvjpeg's ROI primitive operates in the same coordinate space as the decode
+            // output: when apply_exif_orientation is on, that is display (post-orientation)
+            // coords, so we pass the user-supplied region directly. is_region_out_of_bounds
+            // and the clipping bounds therefore use the *effective* image dims that match
+            // the region's coord space.
             const auto& region = codestream_info.code_stream_view->region;
+            const auto [eff_w, eff_h] = nvimgcodec::oriented_dims(
+                cs_image_info.plane_info[0].width, cs_image_info.plane_info[0].height,
+                params->apply_exif_orientation ? image_info.orientation
+                                               : nvimgcodec::kIdentityOrientation);
 
             if (region.ndim != 0) {
                 assert(region.ndim == 2);
                 has_roi = true;
-                has_oob_roi = nvimgcodec::is_region_out_of_bounds(region, cs_image_info.plane_info[0].width, cs_image_info.plane_info[0].height);
+                has_oob_roi = nvimgcodec::is_region_out_of_bounds(region, eff_w, eff_h);
 
-                if (cs_image_info.plane_info[0].height > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
-                    cs_image_info.plane_info[0].width > static_cast<uint32_t>(std::numeric_limits<int>::max())
+                if (eff_h > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+                    eff_w > static_cast<uint32_t>(std::numeric_limits<int>::max())
                 ) {
                     NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Image dimensions exceeds int32, nvjpeg ROI decode is not supported.");
                         image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_FAIL);
@@ -638,8 +677,8 @@ nvimgcodecStatus_t Decoder::decode(const nvimgcodecImageDesc_t* image, const nvi
 
                 roi_y_begin = std::max(0, roi_y_begin);
                 roi_x_begin = std::max(0, roi_x_begin);
-                roi_y_end = std::min(static_cast<int>(cs_image_info.plane_info[0].height), roi_y_end);
-                roi_x_end = std::min(static_cast<int>(cs_image_info.plane_info[0].width), roi_x_end);
+                roi_y_end = std::min(static_cast<int>(eff_h), roi_y_end);
+                roi_x_end = std::min(static_cast<int>(eff_w), roi_x_end);
 
                 NVIMGCODEC_LOG_DEBUG(
                     framework_,
@@ -762,10 +801,16 @@ nvimgcodecStatus_t Decoder::decode(const nvimgcodecImageDesc_t* image, const nvi
         if (has_oob_roi) {
             nvtx3::scoped_range marker{"fill_out_of_bounds_region"};
             NVIMGCODEC_LOG_DEBUG(framework_, plugin_id_, "fill_out_of_bounds_region");
+            // The output buffer (and the user-given region) is in display coords when
+            // apply_exif_orientation is on. Pass the matching dims so OOB pixels are
+            // identified relative to the same coordinate system as the region.
+            const auto [eff_w, eff_h] = nvimgcodec::oriented_dims(
+                cs_image_info.plane_info[0].width, cs_image_info.plane_info[0].height,
+                params->apply_exif_orientation ? image_info.orientation
+                                               : nvimgcodec::kIdentityOrientation);
             try {
                 nvimgcodec::fill_out_of_bounds_region(
-                    image_info,
-                    cs_image_info.plane_info[0].width, cs_image_info.plane_info[0].height,
+                    image_info, eff_w, eff_h,
                     codestream_info.code_stream_view->region
                 );
             } catch (std::runtime_error& e) {

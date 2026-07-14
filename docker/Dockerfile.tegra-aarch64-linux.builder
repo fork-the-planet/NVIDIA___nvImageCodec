@@ -9,9 +9,15 @@ ARG CUDA_TARGET_ARCHS="72;87"
 # 72 : Volta  - gv11b/Tegra (Jetson AGX Xavier)
 # 87 : Ampere - ga10b,ga10c/Tegra (Jetson AGX Orin)
 
+# Host Python that runs the stub codegen and the wheel build. The wheel itself
+# is still produced for every CPython ABI listed below; this only pins which
+# interpreter drives the build (libclang/setuptools/wheel are installed here).
+ARG HOST_PYTHON_VERSION=3.12
+
 ENV CUDA_CROSS_VERSION=${CUDA_CROSS_VERSION}
 ENV CUDA_CROSS_VERSION_DOT=${CUDA_CROSS_VERSION_DOT}
 ENV CUDA_TARGET_ARCHS=${CUDA_TARGET_ARCHS}
+ENV HOST_PYTHON_VERSION=${HOST_PYTHON_VERSION}
 
 RUN apt-get update && \
     apt install -y --no-install-recommends \
@@ -30,8 +36,6 @@ RUN apt-get update && \
         libtool \
         libtool-bin \
         python3 \
-        python3-distutils \
-        python3-pip \
         autogen \
         zip \
     && \
@@ -87,8 +91,14 @@ RUN apt-get update && \
     PYTHON_V=$(python3 -c "import sys;print(f'{sys.version_info[0]}.{sys.version_info[1]}')") && \
     ln -s /usr/bin/python${PYTHON_V}-config /usr/bin/python3-config
 
-# decouple libclang and clang installation so libclang changes are not overriden by clang
-RUN pip install clang==14.0 && pip install libclang==14.0.1 flake8 && \
+# Bootstrap pip for the host Python (HOST_PYTHON_VERSION) and install the
+# packages used by the build: libclang for stub_codegen.py, plus setuptools/wheel
+# for `setup.py bdist_wheel`. clang and libclang are installed separately so a
+# clang upgrade doesn't downgrade libclang. Only the host Python needs these —
+# per-ABI cross headers for the wheels are installed in the next RUN.
+RUN curl -fsSL https://bootstrap.pypa.io/get-pip.py | python${HOST_PYTHON_VERSION} - --quiet && \
+    python${HOST_PYTHON_VERSION} -m pip install --no-cache-dir clang==14.0 && \
+    python${HOST_PYTHON_VERSION} -m pip install --no-cache-dir libclang==14.0.1 setuptools wheel && \
     rm -rf /root/.cache/pip/ && \
     cd /tmp && git clone https://github.com/NixOS/patchelf && cd patchelf && \
     ./bootstrap.sh && ./configure --prefix=/usr/ && make -j install && cd / && rm -rf /tmp/patchelf

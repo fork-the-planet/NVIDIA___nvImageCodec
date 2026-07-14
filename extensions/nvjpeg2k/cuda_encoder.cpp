@@ -34,6 +34,7 @@
 #include "nvimgcodec_type_utils.h"
 #include "imgproc/device_buffer.h"
 #include "imgproc/pinned_buffer.h"
+#include "imgproc/image_info_checks.h"
 #include "nvjpeg2k_utils.h"
 
 using nvimgcodec::PinnedBuffer;
@@ -277,7 +278,21 @@ nvimgcodecProcessingStatus_t EncoderImpl::canEncode(const nvimgcodecCodeStreamDe
             auto sample_type = image_info.plane_info[p].sample_type;
             if (supported_sample_type.find(sample_type) == supported_sample_type.end()) {
                 status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
+                continue;
             }
+            // 0 means "use full bitdepth"; otherwise must fit in the sample type.
+            uint8_t precision = image_info.plane_info[p].precision;
+            uint8_t dtype_bitdepth = static_cast<uint8_t>(sample_type_to_bytes_per_element(sample_type) * 8);
+            if (precision != 0 && precision > dtype_bitdepth) {
+                NVIMGCODEC_LOG_WARNING(framework_, plugin_id_,
+                    "plane_info[" << p << "].precision=" << static_cast<int>(precision)
+                                  << " exceeds the bitdepth of the sample type ("
+                                  << static_cast<int>(dtype_bitdepth) << " bits).");
+                status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
+            }
+        }
+        if (!nvimgcodec::check_planes_consistency(framework_, plugin_id_, image_info)) {
+            status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
         }
 
         static const std::set<nvimgcodecQualityType_t> supported_quality_types{
@@ -530,12 +545,17 @@ nvimgcodecStatus_t EncoderImpl::encode(const nvimgcodecCodeStreamDesc_t* code_st
         }
 
         uint8_t sgn = (sample_type == NVIMGCODEC_SAMPLE_DATA_TYPE_INT8 || sample_type == NVIMGCODEC_SAMPLE_DATA_TYPE_INT16);
-        uint8_t precision =
-            (sample_type == NVIMGCODEC_SAMPLE_DATA_TYPE_UINT16 || sample_type == NVIMGCODEC_SAMPLE_DATA_TYPE_INT16) ? 16 : 8;
+        // canEncode has already validated that any non-zero plane_info[c].precision fits
+        // in the sample type, so we can use it verbatim here and fall back to the dtype's
+        // full bitdepth only when the caller left it as 0.
+        uint8_t default_precision = static_cast<uint8_t>(sample_type_to_bytes_per_element(sample_type) * 8);
+        // supports only the same precision for all planes, checked in canEncode.
+        uint8_t user_precision = image_info.plane_info[0].precision; 
+        uint8_t applied_precision = user_precision ? user_precision : default_precision;
         for (uint32_t c = 0; c < num_components; c++) {
             image_comp_info[c].component_width = width;
             image_comp_info[c].component_height = height;
-            image_comp_info[c].precision = precision;
+            image_comp_info[c].precision = applied_precision;
             image_comp_info[c].sgn = sgn;
         }
 

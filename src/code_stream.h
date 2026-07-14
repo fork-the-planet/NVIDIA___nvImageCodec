@@ -56,6 +56,7 @@ class CodeStream : public ICodeStream
 
   private:
     IImageParser* getParser();
+    nvimgcodecStatus_t ensureCodeStreamInfoParsed();
     nvimgcodecStatus_t ensureParsed();
     void moveImpl(CodeStream&& other);
 
@@ -95,7 +96,8 @@ class CodeStream : public ICodeStream
     nvimgcodecCodeStreamDesc_t code_stream_desc_;
 
     nvimgcodecStatus_t parse_status_ = NVIMGCODEC_STATUS_NOT_INITIALIZED;
-    nvimgcodecCodeStreamView_t code_stream_view_{NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_VIEW, sizeof(nvimgcodecCodeStreamView_t), nullptr, 0, {}, 0, 0};
+    nvimgcodecStatus_t image_info_status_ = NVIMGCODEC_STATUS_NOT_INITIALIZED;
+    nvimgcodecCodeStreamView_t code_stream_view_{NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_VIEW, sizeof(nvimgcodecCodeStreamView_t), nullptr, 0, {}, 0};
     nvimgcodecCodeStreamInfo_t codestream_info_{NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_INFO, sizeof(nvimgcodecCodeStreamInfo_t), nullptr, nullptr, ""};
     nvimgcodecCodeStreamInfoTiffExt_t codestream_info_tiff_ext_{NVIMGCODEC_STRUCTURE_TYPE_TIFF_CODE_STREAM_INFO, sizeof(nvimgcodecCodeStreamInfoTiffExt_t), nullptr, 0, 0, 0, {}};
     nvimgcodecTileGeometryInfo_t tile_geometry_info_{NVIMGCODEC_STRUCTURE_TYPE_TILE_GEOMETRY_INFO, sizeof(nvimgcodecTileGeometryInfo_t), nullptr};

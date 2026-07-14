@@ -20,8 +20,7 @@ import numpy as np
 from nvidia import nvimgcodec
 import pytest as t
 from utils import img_dir_path
-import nvjpeg_test_speedup
-from PIL import Image
+
 
 filenames = [
     "jpeg/padlock-406986_640_420.jpg",
@@ -153,6 +152,16 @@ def test_code_stream_get_sub_code_stream_with_nested_roi_throws_exception(fname)
     assert (isinstance(excinfo.value, RuntimeError) )
     assert (str(excinfo.value) == "Cannot create a sub code stream with nested regions. This is not supported.")
 
+@t.mark.parametrize("fname", ["jpeg/padlock-406986_640_440.jpg"])
+def test_code_stream_get_sub_code_stream_from_roi_throws_exception(fname):
+    fpath = os.path.join(img_dir_path, fname)
+    code_stream = nvimgcodec.CodeStream(fpath)
+    roi1 = nvimgcodec.Region(10, 20, 110, 120)
+
+    sub_cs = code_stream.get_sub_code_stream(region=roi1)
+    with t.raises(RuntimeError, match="nested regions"):
+        sub_cs.get_sub_code_stream()
+
 @t.mark.parametrize("fname", [
     "jpeg/padlock-406986_640_440.jpg", 
     "bmp/cat-111793_640.bmp",
@@ -169,19 +178,27 @@ def test_code_stream_size_for_single_image_file_returns_file_size(fname):
     assert code_stream.size == os.path.getsize(fpath)
 
 
-def test_code_stream_size_for_image_in_multimage_file_returns_bistream_size_of_the_image():
+def test_code_stream_size_for_tiff_image_view_returns_backing_file_size():
     fpath = os.path.join(img_dir_path, "tiff/multi_page.tif")
+    file_size = os.path.getsize(fpath)
     code_stream = nvimgcodec.CodeStream(fpath)
-    assert code_stream.size == os.path.getsize(fpath)
+    assert code_stream.size == file_size
 
     for i in range(code_stream.num_images):
         sub_cs = code_stream.get_sub_code_stream(i)
-        
-        with Image.open(fpath) as img:
-            img.seek(i)
-            page_size = len(img.tobytes())
-        
-        assert sub_cs.size == page_size
+        assert sub_cs.size == file_size
+
+
+def test_code_stream_size_for_tiff_roi_view_returns_backing_file_size():
+    fpath = os.path.join(img_dir_path, "tiff/multi_page.tif")
+    file_size = os.path.getsize(fpath)
+    code_stream = nvimgcodec.CodeStream(fpath)
+    image_cs = code_stream.get_sub_code_stream(0)
+    roi_cs = code_stream.get_sub_code_stream(0, region=nvimgcodec.Region(0, 0, 8, 8))
+
+    assert code_stream.size == file_size
+    assert image_cs.size == file_size
+    assert roi_cs.size == file_size
 
 
 @t.mark.parametrize("pre_allocated_size", [0, 1024, 4096])
@@ -195,4 +212,3 @@ def test_code_stream_creation_for_encode_output(pre_allocated_size, pin_memory):
     
     assert code_stream.capacity == pre_allocated_size
     assert code_stream.pin_memory == pin_memory
-

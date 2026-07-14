@@ -214,7 +214,7 @@ def _get_decoder_resources() -> Any:
     global _NVIMGCODEC_DECODER
 
     if _NVIMGCODEC_DECODER is None:
-        _NVIMGCODEC_DECODER = nvimgcodec.Decoder(options=":fancy_upsampling=1")
+        _NVIMGCODEC_DECODER = nvimgcodec.Decoder()
 
     return _NVIMGCODEC_DECODER
 

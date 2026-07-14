@@ -1,0 +1,33 @@
+# Conda test image: CUDA runtime + Miniconda for testing conda-built packages
+ARG CUDA_VERSION=12.9.0
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Miniconda — pinned to a specific py312 release with SHA256
+# verification so image rebuilds are deterministic and the installer is
+# authenticated before execution. To upgrade, look up the new filename
+# and hash at https://repo.anaconda.com/miniconda/ and bump both values.
+ARG MINICONDA_INSTALLER=Miniconda3-py312_26.1.1-1-Linux-x86_64.sh
+ARG MINICONDA_SHA256=eef1283cdc9d37f55743778ea4567e91aa28c2e3be4adab529dda324c3c897a2
+RUN curl -fsSL "https://repo.anaconda.com/miniconda/${MINICONDA_INSTALLER}" -o /tmp/miniconda.sh && \
+    echo "${MINICONDA_SHA256}  /tmp/miniconda.sh" | sha256sum -c - && \
+    bash /tmp/miniconda.sh -b -p /opt/conda && \
+    rm /tmp/miniconda.sh
+
+ENV PATH="/opt/conda/bin:${PATH}"
+
+# Remove default Anaconda channels (require ToS acceptance) and use only conda-forge
+RUN printf 'channels:\n  - conda-forge\n' > /opt/conda/.condarc && \
+    conda init bash && \
+    conda update -y conda && \
+    conda install -y -n base -c conda-forge conda-index
+
+WORKDIR /workspace

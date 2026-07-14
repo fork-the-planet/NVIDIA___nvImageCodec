@@ -200,7 +200,7 @@ Examples:
                         code_block_size=tuple(args.htj2k_code_block_size),
                         progression_order=args.htj2k_progression_order,
                         max_batch_size=args.batch_size,
-                        skip_transfer_syntaxes=["1.2.840.10008.1.2.4.201", "1.2.840.10008.1.2.4.202"],
+                        skip_transfer_syntaxes=["1.2.840.10008.1.2.4.201", "1.2.840.10008.1.2.4.202", "1.2.840.10008.1.2.4.203"],
                     )
                     for dataset in enhanced_datasets:
                         _save_dataset(dataset, args.output_dir)

@@ -40,18 +40,21 @@ using namespace py::literals;
 class ILogger;
 struct DeviceBuffer;
 struct PinnedBuffer;
+struct PageableHostBuffer;
 
 class Image
 {
   public:
-    Image(nvimgcodecInstance_t instance, ILogger* logger, nvimgcodecImageInfo_t* image_info);
+    Image(nvimgcodecInstance_t instance, ILogger* logger, nvimgcodecImageInfo_t* image_info, int device_id = NVIMGCODEC_DEVICE_CURRENT);
     Image(nvimgcodecInstance_t instance, ILogger* logger, PyObject* o, intptr_t cuda_stream,
           std::optional<nvimgcodecSampleFormat_t> sample_format = std::nullopt,
-          std::optional<nvimgcodecColorSpec_t> color_spec = std::nullopt);
+          std::optional<nvimgcodecColorSpec_t> color_spec = std::nullopt,
+          std::optional<int> precision = std::nullopt);
 
     int getWidth() const;
     int getHeight() const;
     int getNdim() const;
+    int num_channels() const;
 
     nvimgcodecImageBufferKind_t getBufferKind() const;
     size_t size() const; // size of the data in the buffer
@@ -67,20 +70,30 @@ class Image
     int precision() const;
     nvimgcodecSampleFormat_t getSampleFormat() const; 
     nvimgcodecColorSpec_t getColorSpec() const;
+    std::optional<int> getDeviceId() const;
+    std::optional<intptr_t> getCudaStream() const;
 
     py::capsule dlpack(py::object stream) const;
     const py::tuple getDlpackDevice() const;
 
     py::object cpu();
-    py::object cuda(bool synchronize);
+    py::object cuda(bool synchronize, int device_id = NVIMGCODEC_DEVICE_CURRENT, intptr_t cuda_stream = 0);
 
     void reuse(nvimgcodecImageInfo_t* image_info);
+
+    // Rebind any internal buffer's deleter so it no longer references the
+    // CUDA stream it was allocated on. After this call, the caller may
+    // destroy the originating stream at any time without affecting correct
+    // cleanup of this image. Safe no-op for externally-managed buffers.
+    void detachFromUserStream() noexcept;
 
     nvimgcodecImage_t getNvImgCdcsImage() const;
     static void exportToPython(py::module& m);
 
   private:
-    void initImageInfoFromDLPack(nvimgcodecImageInfo_t* image_info, py::capsule cap);
+    void initImageInfoFromDLPack(nvimgcodecImageInfo_t* image_info, py::capsule cap,
+        std::optional<nvimgcodecSampleFormat_t> sample_format = std::nullopt,
+        std::optional<nvimgcodecColorSpec_t> color_spec = std::nullopt);
     void initImageInfoFromInterfaceDict(const py::dict& d, nvimgcodecImageInfo_t* image_info,
         std::optional<nvimgcodecSampleFormat_t> sample_format = std::nullopt,
         std::optional<nvimgcodecColorSpec_t> color_spec = std::nullopt);
@@ -94,10 +107,10 @@ class Image
 
     nvimgcodecInstance_t instance_;
     ILogger* logger_;
+    int device_id_;
     ImageBuffer img_buffer_;
     std::shared_ptr<std::remove_pointer<nvimgcodecImage_t>::type> image_;
     std::shared_ptr<DLPackTensor> dlpack_tensor_;
-
 };
 
 } // namespace nvimgcodec

@@ -26,12 +26,20 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     set(CMAKE_CUDA_EXTENSIONS OFF)
 
+    include(GNUInstallDirs)
+    set(NVIMGCODEC_INSTALL_BINDIR "${CMAKE_INSTALL_BINDIR}")
+
     option(BUILD_CVCUDA_SAMPLES "Build CVCUDA samples" OFF)
 
     find_package(CUDAToolkit REQUIRED)
 
-    list(APPEND CMAKE_PREFIX_PATH "/opt/nvidia/nvimgcodec_cuda${CUDAToolkit_VERSION_MAJOR}/cmake")
-    find_package(nvimgcodec CONFIG REQUIRED)
+    find_package(nvimgcodec CONFIG QUIET)
+    if(NOT nvimgcodec_FOUND)
+        message(FATAL_ERROR
+            "Could not find nvimgcodecConfig.cmake. Set nvimgcodec_DIR to the CUDA-scoped package directory, "
+            "for example /usr/${CMAKE_INSTALL_LIBDIR}/libnvimgcodec/<cuda_major>/cmake/nvimgcodec "
+            "or C:/Program Files/NVIDIA nvImageCodec/lib/libnvimgcodec/<cuda_major>/cmake/nvimgcodec.")
+    endif()
 
     include_directories(${nvimgcodec_INCLUDE_DIR})
     link_directories(${nvimgcodec_LIB_DIR})
@@ -65,4 +73,3 @@ add_subdirectory(nvimtrans)
 if(BUILD_CVCUDA_SAMPLES)
     add_subdirectory(nvimproc)
 endif()
-

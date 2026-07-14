@@ -31,6 +31,7 @@
 #include "errors_handling.h"
 #include "log.h"
 #include "imgproc/pinned_buffer.h"
+#include "imgproc/image_info_checks.h"
 #include "type_convert.h"
 
 using nvimgcodec::PinnedBuffer;
@@ -297,6 +298,9 @@ nvimgcodecProcessingStatus_t HwEncoderImpl::canEncode(const nvimgcodecCodeStream
                 status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
             }
         }
+        if (!nvimgcodec::check_planes_consistency(framework_, plugin_id_, image_info)) {
+            status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
+        }
 
         // Hardware only support images with even dimensions at most 16384 x 16384
         uint32_t w = image_info.plane_info[0].width;
@@ -431,6 +435,8 @@ nvimgcodecStatus_t HwEncoderImpl::encode(const nvimgcodecCodeStreamDesc_t* code_
             image->imageReady(image->instance, NVIMGCODEC_PROCESSING_STATUS_IMAGE_CORRUPTED);
             return ret;
         }
+
+        nvimgcodec::warn_if_custom_precision_unsupported(framework_, plugin_id_, image_info);
 
         auto& t = per_thread_[thread_idx];
 

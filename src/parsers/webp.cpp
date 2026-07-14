@@ -17,6 +17,7 @@
 
 #include "parsers/webp.h"
 #include <nvimgcodec.h>
+#include <cassert>
 #include <string.h>
 #include <vector>
 
@@ -167,20 +168,15 @@ nvimgcodecStatus_t GetImageInfoImpl(const char* plugin_id, const nvimgcodecFrame
 
     nchannels += static_cast<int>(alpha);
 
-    if (nchannels == 1) {
-        image_info->sample_format = NVIMGCODEC_SAMPLEFORMAT_P_Y;
-    } else if (nchannels == 2) {
-        image_info->sample_format = NVIMGCODEC_SAMPLEFORMAT_I_YA;
-    } else if (nchannels == 3) {
-        image_info->sample_format = NVIMGCODEC_SAMPLEFORMAT_I_RGB;
-    } else if (nchannels == 4) {
-        image_info->sample_format = NVIMGCODEC_SAMPLEFORMAT_I_RGBA;
-    } else {
-        image_info->sample_format = NVIMGCODEC_SAMPLEFORMAT_UNKNOWN;
-    } 
+    // The WebP parser always reports RGB or RGBA: nchannels is initialised to 3
+    // above and the only modification is `+= alpha` (0 or 1), so by construction
+    // nchannels is either 3 or 4. The assert documents that contract; 
+    assert(nchannels == 3 || nchannels == 4);
+    image_info->sample_format = (nchannels == 4) ? NVIMGCODEC_SAMPLEFORMAT_I_RGBA
+                                                 : NVIMGCODEC_SAMPLEFORMAT_I_RGB;
     image_info->orientation = {NVIMGCODEC_STRUCTURE_TYPE_ORIENTATION, sizeof(nvimgcodecOrientation_t), nullptr, 0, false, false};
     image_info->chroma_subsampling = NVIMGCODEC_SAMPLING_NONE;
-    image_info->color_spec = nchannels >= 3 ? NVIMGCODEC_COLORSPEC_SRGB : NVIMGCODEC_COLORSPEC_GRAY;
+    image_info->color_spec = NVIMGCODEC_COLORSPEC_SRGB;
     image_info->num_planes = 1;
     image_info->orientation = orientation;
     image_info->plane_info[0].height = height;

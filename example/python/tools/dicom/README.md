@@ -199,7 +199,7 @@ The tool includes comprehensive test suites:
 
 Run tests with:
 ```bash
-pytest -v test/python/example/tools/dicom/
+pytest -v test/python/integration/dicom/
 ```
 
 ## Troubleshooting

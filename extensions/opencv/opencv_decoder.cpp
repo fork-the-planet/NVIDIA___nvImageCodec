@@ -28,6 +28,8 @@
 
 #include "imgproc/convert.h"
 #include "imgproc/out_of_bound_roi_fill.h"
+#include "imgproc/region_orientation.h"
+#include "imgproc/image_info_checks.h"
 
 namespace opencv {
 
@@ -190,12 +192,10 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(
             status |= NVIMGCODEC_PROCESSING_STATUS_NUM_PLANES_UNSUPPORTED;
         }
 
-        auto sample_type = image_info.plane_info[0].sample_type;
-        for (size_t p = 1; p < image_info.num_planes; p++) {
-            if (image_info.plane_info[p].sample_type != sample_type) {
-                status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
-            }
+        if (!nvimgcodec::check_planes_consistency(framework_, plugin_id_, image_info)) {
+            status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
         }
+        auto sample_type = image_info.plane_info[0].sample_type;
         switch (sample_type) {
         case NVIMGCODEC_SAMPLE_DATA_TYPE_UINT8:
         case NVIMGCODEC_SAMPLE_DATA_TYPE_UINT16:
@@ -224,7 +224,9 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(
             if (region.ndim == 0) {
                 // no ROI, okay
             } else if (region.ndim == 2) {
-                if (nvimgcodec::is_region_out_of_bounds(region, cs_image_info.plane_info[0].width, cs_image_info.plane_info[0].height)) {
+                if (nvimgcodec::is_region_out_of_bounds_effective(region, image_info.orientation,
+                        cs_image_info.plane_info[0].width, cs_image_info.plane_info[0].height,
+                        params->apply_exif_orientation)) {
                     NVIMGCODEC_LOG_WARNING(framework_, plugin_id_, "Out of bounds region is not supported.");
                     status |= NVIMGCODEC_PROCESSING_STATUS_ROI_UNSUPPORTED;
                 }

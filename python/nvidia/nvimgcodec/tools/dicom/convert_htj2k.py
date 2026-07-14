@@ -55,7 +55,7 @@ def _get_nvimgcodec_decoder():
     """Get or create the global nvimgcodec decoder instance."""
     global _NVIMGCODEC_DECODER
     if _NVIMGCODEC_DECODER is None:
-        _NVIMGCODEC_DECODER = nvimgcodec.Decoder(options=":fancy_upsampling=1")
+        _NVIMGCODEC_DECODER = nvimgcodec.Decoder()
     return _NVIMGCODEC_DECODER
 
 
@@ -463,6 +463,7 @@ def transcode_datasets_to_htj2k(
         for idx in nvimgcodec_batch:
             try:
                 ds = batch_datasets[idx]
+                fix_malformed_dicom(ds)
                 number_of_frames = int(ds.NumberOfFrames) if hasattr(ds, "NumberOfFrames") else None
 
                 if "PixelData" not in ds:

@@ -27,6 +27,8 @@
 
 #include "nvimgcodec_tests.h"
 #include "nvjpeg2k_ext_test_common.h"
+#include "common_ext_encoder_test.h"
+#include "parsers/jpeg2k.h"
 
 using ::testing::Bool;
 using ::testing::Combine;
@@ -623,5 +625,208 @@ INSTANTIATE_TEST_SUITE_P(NVJPEG2K_ENCODE_INVALID_QUALITY_NEGATIVE_VALUE, NvJpeg2
 );
 
 // clang-format on
+
+// Tests that the nvjpeg2k encoder honors a custom plane_info.precision and that the
+// resulting bitstream round-trips that precision through the parser/decoder. Covers
+// both sub-8 precision (e.g. 4-bit data in uint8) and supra-8 precision (e.g. 12-bit
+// data in uint16).
+struct CustomPrecisionCase
+{
+    nvimgcodecSampleDataType_t sample_type;
+    uint8_t precision;
+};
+
+class NvJpeg2kExtEncoderTestCustomPrecision : public NvJpeg2kExtEncoderTestBase,
+                                              public ::testing::TestWithParam<CustomPrecisionCase>
+{
+  public:
+    void SetUp() override
+    {
+        NvJpeg2kExtEncoderTestBase::SetUp();
+        params_.quality_type = NVIMGCODEC_QUALITY_TYPE_LOSSLESS;
+        params_.quality_value = 0;
+        jpeg2k_enc_params_.stream_type = NVIMGCODEC_JPEG2K_STREAM_J2K;
+    }
+
+    void TearDown() override { NvJpeg2kExtEncoderTestBase::TearDown(); }
+
+    template <typename T>
+    void FillPattern(T* buf, uint32_t width, uint32_t height, uint32_t channels, uint8_t precision)
+    {
+        const uint32_t max_value = (precision >= 32) ? 0xFFFFFFFFu : ((1u << precision) - 1u);
+        for (uint32_t y = 0; y < height; ++y) {
+            for (uint32_t x = 0; x < width; ++x) {
+                for (uint32_t c = 0; c < channels; ++c) {
+                    uint32_t v = (x * 17u + y * 31u + c * 113u) & max_value;
+                    buf[(y * width + x) * channels + c] = static_cast<T>(v);
+                }
+            }
+        }
+    }
+};
+
+TEST_P(NvJpeg2kExtEncoderTestCustomPrecision, EncodesAndPreservesPrecisionInBitstream)
+{
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 48;
+    const auto& tc = GetParam();
+    const uint8_t precision = tc.precision;
+    const nvimgcodecSampleDataType_t sample_type = tc.sample_type;
+    const size_t bytes_per_sample = (sample_type == NVIMGCODEC_SAMPLE_DATA_TYPE_UINT8) ? 1 : 2;
+
+    image_info_ = {NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};
+    image_info_.color_spec = NVIMGCODEC_COLORSPEC_GRAY;
+    image_info_.sample_format = NVIMGCODEC_SAMPLEFORMAT_I_Y;
+    image_info_.chroma_subsampling = NVIMGCODEC_SAMPLING_GRAY;
+    image_info_.num_planes = 1;
+    image_info_.plane_info[0].width = width;
+    image_info_.plane_info[0].height = height;
+    image_info_.plane_info[0].num_channels = 1;
+    image_info_.plane_info[0].sample_type = sample_type;
+    image_info_.plane_info[0].precision = precision;
+    image_info_.plane_info[0].row_stride = width * bytes_per_sample;
+    image_buffer_.resize(GetBufferSize(image_info_));
+    image_info_.buffer = image_buffer_.data();
+    image_info_.buffer_kind = NVIMGCODEC_IMAGE_BUFFER_KIND_STRIDED_HOST;
+
+    if (bytes_per_sample == 1) {
+        FillPattern<uint8_t>(reinterpret_cast<uint8_t*>(image_buffer_.data()), width, height, 1, precision);
+    } else {
+        FillPattern<uint16_t>(reinterpret_cast<uint16_t*>(image_buffer_.data()), width, height, 1, precision);
+    }
+
+    nvimgcodecImageInfo_t cs_image_info(image_info_);
+    std::strcpy(cs_image_info.codec_name, "jpeg2k");
+
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecImageCreate(instance_, &in_image_, &image_info_));
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS,
+        nvimgcodecCodeStreamCreateToHostMem(instance_, &out_code_stream_, (void*)this,
+            &NvJpeg2kExtEncoderTestCustomPrecision::ResizeBufferStatic<NvJpeg2kExtEncoderTestCustomPrecision>, &cs_image_info));
+    images_.push_back(in_image_);
+    streams_.push_back(out_code_stream_);
+
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecEncoderEncode(encoder_, images_.data(), streams_.data(), 1, &params_, &future_));
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecFutureWaitForAll(future_));
+    nvimgcodecProcessingStatus_t encode_status;
+    size_t status_size = 0;
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecFutureGetProcessingStatus(future_, &encode_status, &status_size));
+    ASSERT_EQ(NVIMGCODEC_PROCESSING_STATUS_SUCCESS, encode_status);
+
+    LoadImageFromHostMemory(instance_, in_code_stream_, code_stream_buffer_.data(), code_stream_buffer_.size());
+    nvimgcodecImageInfo_t parsed_info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecCodeStreamGetImageInfo(in_code_stream_, &parsed_info));
+
+    // The jpeg2k parser reads precision from the Ssiz field of the SIZ marker. If the
+    // encoder wrote `precision`, the parser will report `precision` here.
+    EXPECT_EQ(precision, parsed_info.plane_info[0].precision);
+    EXPECT_EQ(sample_type, parsed_info.plane_info[0].sample_type);
+    EXPECT_EQ(width, parsed_info.plane_info[0].width);
+    EXPECT_EQ(height, parsed_info.plane_info[0].height);
+}
+
+INSTANTIATE_TEST_SUITE_P(NVJPEG2K_ENCODE_CUSTOM_PRECISION, NvJpeg2kExtEncoderTestCustomPrecision,
+    ::testing::Values(
+        // Sub-8 precision carried in a uint8 buffer
+        CustomPrecisionCase{NVIMGCODEC_SAMPLE_DATA_TYPE_UINT8, 4},
+        CustomPrecisionCase{NVIMGCODEC_SAMPLE_DATA_TYPE_UINT8, 5},
+        CustomPrecisionCase{NVIMGCODEC_SAMPLE_DATA_TYPE_UINT8, 7},
+        // Boundary: precision == bitdepth
+        CustomPrecisionCase{NVIMGCODEC_SAMPLE_DATA_TYPE_UINT8, 8},
+        // Supra-8 precision carried in a uint16 buffer
+        CustomPrecisionCase{NVIMGCODEC_SAMPLE_DATA_TYPE_UINT16, 10},
+        CustomPrecisionCase{NVIMGCODEC_SAMPLE_DATA_TYPE_UINT16, 12},
+        CustomPrecisionCase{NVIMGCODEC_SAMPLE_DATA_TYPE_UINT16, 14},
+        CustomPrecisionCase{NVIMGCODEC_SAMPLE_DATA_TYPE_UINT16, 16}));
+
+class NvJpeg2kExtEncoderTestCustomPrecisionNegative : public NvJpeg2kExtEncoderTestBase, public ::testing::Test
+{
+  public:
+    void SetUp() override
+    {
+        NvJpeg2kExtEncoderTestBase::SetUp();
+        params_.quality_type = NVIMGCODEC_QUALITY_TYPE_LOSSLESS;
+        params_.quality_value = 0;
+        jpeg2k_enc_params_.stream_type = NVIMGCODEC_JPEG2K_STREAM_J2K;
+    }
+    void TearDown() override { NvJpeg2kExtEncoderTestBase::TearDown(); }
+};
+
+TEST_F(NvJpeg2kExtEncoderTestCustomPrecisionNegative, CanEncodeRejectsPrecisionGreaterThanBitdepth)
+{
+    image_info_ = {NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};
+    image_info_.color_spec = NVIMGCODEC_COLORSPEC_GRAY;
+    image_info_.sample_format = NVIMGCODEC_SAMPLEFORMAT_I_Y;
+    image_info_.chroma_subsampling = NVIMGCODEC_SAMPLING_GRAY;
+    image_info_.num_planes = 1;
+    image_info_.plane_info[0].width = 32;
+    image_info_.plane_info[0].height = 32;
+    image_info_.plane_info[0].num_channels = 1;
+    image_info_.plane_info[0].sample_type = NVIMGCODEC_SAMPLE_DATA_TYPE_UINT8;
+    image_info_.plane_info[0].precision = 12;  // invalid: 8-bit dtype cannot carry 12-bit data
+    image_info_.plane_info[0].row_stride = image_info_.plane_info[0].width;
+    image_buffer_.resize(GetBufferSize(image_info_));
+    image_info_.buffer = image_buffer_.data();
+    image_info_.buffer_kind = NVIMGCODEC_IMAGE_BUFFER_KIND_STRIDED_HOST;
+
+    nvimgcodecImageInfo_t cs_image_info(image_info_);
+    std::strcpy(cs_image_info.codec_name, "jpeg2k");
+
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecImageCreate(instance_, &in_image_, &image_info_));
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS,
+        nvimgcodecCodeStreamCreateToHostMem(instance_, &out_code_stream_, (void*)this,
+            &NvJpeg2kExtEncoderTestCustomPrecisionNegative::ResizeBufferStatic<NvJpeg2kExtEncoderTestCustomPrecisionNegative>, &cs_image_info));
+    images_.push_back(in_image_);
+    streams_.push_back(out_code_stream_);
+
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecEncoderEncode(encoder_, images_.data(), streams_.data(), 1, &params_, &future_));
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecFutureWaitForAll(future_));
+    nvimgcodecProcessingStatus_t encode_status;
+    size_t status_size = 0;
+    ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecFutureGetProcessingStatus(future_, &encode_status, &status_size));
+    EXPECT_TRUE(encode_status & NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED);
+}
+
+// ---------------------------------------------------------------------------
+// Strided encode->decode round-trip via the shared CommonExtEncoderTest harness.
+// One test case per input plane-stride layout, exercising the strided host->
+// device input copy feeding the nvJPEG2000 encoder. Uses lossless encoding so
+// the round-trip is exact.
+// ---------------------------------------------------------------------------
+class NvJpeg2kExtEncodeDecodeStrideTest :
+    public CommonExtEncoderTest,
+    public TestWithParam<nvimgcodecSampleFormat_t>
+{
+  public:
+    void SetUp() override
+    {
+        CommonExtEncoderTest::SetUp();
+
+        nvimgcodecExtensionDesc_t jpeg2k_parser_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_jpeg2k_parser_extension_desc(&jpeg2k_parser_desc));
+        extensions_.emplace_back();
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &jpeg2k_parser_desc));
+
+        nvimgcodecExtensionDesc_t nvjpeg2k_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_nvjpeg2k_extension_desc(&nvjpeg2k_desc));
+        extensions_.emplace_back();
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &nvjpeg2k_desc));
+
+        color_spec_ = NVIMGCODEC_COLORSPEC_SRGB;
+        sample_format_ = GetParam();
+        chroma_subsampling_ = NVIMGCODEC_SAMPLING_444;
+        jpeg2k_stream_type_ = NVIMGCODEC_JPEG2K_STREAM_JP2;
+        jpeg2k_ht_ = 0;
+
+        CommonExtEncoderTest::CreateDecoderAndEncoder();
+        encode_params_.quality_type = NVIMGCODEC_QUALITY_TYPE_LOSSLESS;
+    }
+
+    void TearDown() override { CommonExtEncoderTest::TearDown(); }
+};
+
+DEFINE_ENCODE_DECODE_STRIDE_TESTS_FOR_CODEC(NvJpeg2kExtEncodeDecodeStrideTest, "jpeg2k", false)
+
+INSTANTIATE_TEST_SUITE_P(NVJPEG2K_ENCODE_DECODE_STRIDED, NvJpeg2kExtEncodeDecodeStrideTest,
+    Values(NVIMGCODEC_SAMPLEFORMAT_I_RGB, NVIMGCODEC_SAMPLEFORMAT_P_RGB));
 
 }} // namespace nvimgcodec::test

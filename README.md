@@ -1,11 +1,11 @@
 # nvImageCodec
 
-![Version](https://img.shields.io/badge/Version-v0.8.0--beta-blue)
+![Version](https://img.shields.io/badge/Version-v0.9.0--beta-blue)
 [![License](https://img.shields.io/badge/License-Apache_2.0-yellogreen.svg)](https://opensource.org/licenses/Apache-2.0)
 
 ![Platform](https://img.shields.io/badge/Platform-linux--x86__64_%7C_linux--aarch64_%7C_windows--64_wsl2_%7C_windows--64-blue)
 
-[![Cuda](https://img.shields.io/badge/CUDA-v12.0_%7c_v13.0-%2376B900?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit-archive)
+[![Cuda](https://img.shields.io/badge/CUDA-v12.1_%7c_v13.3-%2376B900?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit-archive)
 [![GCC](https://img.shields.io/badge/GCC->=v14.0-yellow)](https://gcc.gnu.org/gcc-9/)
 [![CMake](https://img.shields.io/badge/CMake->=v3.18-%23008FBA?logo=cmake)](https://cmake.org/)
 
@@ -189,7 +189,7 @@ Please see also [nvCOMP installation documentation](https://docs.nvidia.com/cuda
   - [Microsoft Visual Studio 2022 Build Tools](https://aka.ms/vs/17/release/vs_buildtools.exe)
 - Dependencies for extensions. If you would not like to build particular extension you can skip it.
   - nvJPEG2000 >= 0.9.1
-  - nvTIFF >= 0.6.0
+  - nvTIFF >= 0.8.0
   - nvCOMP >= 5.1.0
   - libjpeg-turbo >= 3.0.3
   - libtiff >= 4.6.0
@@ -261,35 +261,39 @@ This will generate in build directory *.zip or *tar.xz files
 #### Tar file installation
 
 ```
-tar -xvf nvimgcodec-0.8.0.0-cuda12-x86_64-linux-lib.tar.gz -C /opt/nvidia/
+tar -xvf nvimgcodec-0.9.0.0-cuda12-x86_64-linux-lib.tar.gz -C /
 ```
 
 #### DEB File Installation
 ```
-sudo apt-get install -y ./nvimgcodec-0.8.0.0-cuda12-x86_64-linux-lib.deb
+sudo apt-get install -y ./nvimgcodec-0.9.0.0-cuda12-x86_64-linux-lib.deb
 ```
 #### Python WHL File Installation
 
 ```
-pip install nvidia_nvimgcodec_cu12-0.8.0-py3-none-manylinux_2_28_x86_64.whl
+pip install nvidia_nvimgcodec_cu12-0.9.0-py3-none-manylinux_2_28_x86_64.whl
 ```
 
 ### Installation from sources
 
 ##### Linux
-```
+```bash
 cd build
-cmake --install . --config Release --prefix /opt/nvidia/nvimgcodec_<major_cuda_ver>
+cmake --install . --config Release --prefix /usr
 ```
 
 After execution there should be:
-- all extension modules in /opt/nvidia/nvimgcodec_cuda<major_cuda_ver>/extensions (it is default directory for extension discovery)
-- libnvimgcodec.so in /opt/nvidia/nvimgcodec_cuda<major_cuda_ver>/lib64
+- all extension modules in /usr/<libdir>/libnvimgcodec/<major_cuda_ver>/extensions (it is the default directory for extension discovery)
+- libnvimgcodec.so in /usr/<libdir>/libnvimgcodec/<major_cuda_ver>
+- nvimtrans in /usr/bin/nvimgcodec/<major_cuda_ver>
+- public headers in /usr/include
+
+Here, `<libdir>` is the platform library directory selected by CMake, for example `lib64` or `lib`.
 
 Add directory with libnvimgcodec.so to LD_LIBRARY_PATH
 
-```
-export LD_LIBRARY_PATH=/opt/nvidia/nvimgcodec_cuda<major_cuda_ver>/lib64:$LD_LIBRARY_PATH
+```bash
+export LD_LIBRARY_PATH=/usr/<libdir>/libnvimgcodec/<major_cuda_ver>:$LD_LIBRARY_PATH
 ```
 
 ##### Windows
@@ -298,15 +302,15 @@ Open Developer Command Prompt for VS 2022
 
 ```
 cd build
-cmake --install . --config Release --prefix "c:\Program Files\nvimgcodec_cuda<major_cuda_ver>"
+cmake --install . --config Release --prefix "c:\Program Files\NVIDIA nvImageCodec"
 ```
 
 After execution there should be:
 
-- all extension modules in c:\Program Files\nvimgcodec_cuda<major_cuda_ver>/extensions (it is default directory for extension discovery)
-- nvimgcodec_0.dll in c:\Program Files\nvimgcodec_cuda<major_cuda_ver>\bin
+- all extension modules in `c:\Program Files\NVIDIA nvImageCodec\bin\<major_cuda_ver>\extensions` (it is default directory for extension discovery)
+- `nvimgcodec_0.dll` in `c:\Program Files\NVIDIA nvImageCodec\bin\<major_cuda_ver>`
 
-Add directory with nvimgcodec_0.dll to PATH
+Add directories with `nvimgcodec_0.dll` and extension modules to PATH
 
 ## Testing
 Run CTest to execute L0 and L1 tests
@@ -317,12 +321,12 @@ ctest -C Release
 ```
 
 Run sample transcoder app tests
-```
+```bash
 cd build
 cmake --install . --config Release --prefix bin
 cd bin/test
 
-LD_LIBRARY_PATH=$PWD/../lib64 pytest -v test_transcode.py
+LD_LIBRARY_PATH=$PWD/../lib64/libnvimgcodec/<major_cuda_ver> pytest -v test_transcode.py
 
 ```
 
@@ -331,7 +335,7 @@ Run Python API tests
 First install python wheel. You would also need to have installed all Python tests dependencies (see Dockerfiles). 
 
 ```
-pip install nvidia_nvimgcodec_cu12-0.8.0.x-py3-none-manylinux_2_28_x86_64.whl
+pip install nvidia_nvimgcodec_cu12-0.9.0.x-py3-none-manylinux_2_28_x86_64.whl
 ```
 
 Run tests
@@ -347,9 +351,11 @@ pytest -v ./python -m slow
 
 ## CMake package integration
 
-To use nvimagecodec as a dependency in your CMake project, use:
-```
-list(APPEND CMAKE_PREFIX_PATH "/opt/nvidia/nvimgcodec_cuda<major_cuda_ver>/")  # or the prefix where the package was installed if custom
+To use nvimagecodec as a dependency in your CMake project, point CMake to the CUDA-major-specific package directory:
+```cmake
+set(nvimgcodec_DIR "/usr/lib64/libnvimgcodec/<major_cuda_ver>/cmake/nvimgcodec")
+# On Windows:
+# set(nvimgcodec_DIR "C:/Program Files/NVIDIA nvImageCodec/lib/libnvimgcodec/<major_cuda_ver>/cmake/nvimgcodec")
 
 find_package(nvimgcodec CONFIG REQUIRED)
 # Mostly for showing some of the variables defined
@@ -366,3 +372,4 @@ target_link_directories(<your-target> PUBLIC ${nvimgcodec_LIB_DIR})
 target_link_libraries(<your-target> PUBLIC ${nvimgcodec_LIB})
 ```
 
+Use the actual CMake library directory from the installation layout above if your platform installs to a directory other than `lib64`, for example `lib`. Alternatively, add `/usr/lib64/libnvimgcodec/<major_cuda_ver>` to `CMAKE_PREFIX_PATH`. With the CUDA-scoped layout, using only `/usr` as a CMake package prefix is not sufficient because the package config lives below the CUDA-major directory so multiple CUDA-major packages can coexist; making `/usr` sufficient again would require a CUDA-major-selecting config in a standard CMake search path.

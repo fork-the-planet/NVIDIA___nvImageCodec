@@ -164,7 +164,7 @@ build_all() {
     echo ""
 
     if [ "$CREATE_TARBALL" = "1" ] && [ -n "$CONDA_BUILD_OUTPUT_DIR" ] && [ -d "$CONDA_BUILD_OUTPUT_DIR" ]; then
-        TARBALL_NAME="nvimgcodec-conda-packages-$(date +%Y%m%d-%H%M%S).tar.gz"
+        TARBALL_NAME="nvimgcodec-conda-packages-cu${CUDA_VER%%.*}-$(date +%Y%m%d-%H%M%S).tar.gz"
         TARBALL_PATH="${SCRIPT_DIR}/${TARBALL_NAME}"
         echo "Creating tarball: $TARBALL_PATH"
         tar -czvf "$TARBALL_PATH" -C "$CONDA_BUILD_OUTPUT_DIR" .
@@ -230,39 +230,40 @@ fi
 echo "Cloning feedstock from $FEEDSTOCK_REPO..."
 conda_retry git clone "$FEEDSTOCK_REPO" "$WORK_DIR"
 
-# Remove feedstock patches listed in patches_to_disable.txt (so they are not applied)
-PATCHES_TO_DISABLE_FILE="${SCRIPT_DIR}/patches_to_disable.txt"
-RECIPE_PATCHES_DIR="${WORK_DIR}/recipe/patches"
-if [ -f "$PATCHES_TO_DISABLE_FILE" ] && [ -d "$RECIPE_PATCHES_DIR" ]; then
-    while IFS= read -r line || [ -n "$line" ]; do
-        line="${line%%#*}"
-        line="$(echo "$line" | tr -d '[:space:]')"
-        [ -z "$line" ] && continue
-        if [ -f "$RECIPE_PATCHES_DIR/$line" ]; then
-            echo "Disabling feedstock patch: $line"
-            rm -f "$RECIPE_PATCHES_DIR/$line"
+# Overlay local recipe files from conda/recipes/<recipe>/ onto the cloned feedstock recipe.
+# Makes conda/recipes/<recipe>/ the authoritative source for meta.yaml, build.sh, bld.bat,
+# and patches/, without forking the conda-forge feedstock. patches/ is replaced wholesale;
+# other top-level files are overwritten by basename.
+RECIPE_NAME="${FEEDSTOCK_NAME%-feedstock}"
+LOCAL_RECIPE_DIR="${SCRIPT_DIR}/recipes/${RECIPE_NAME}"
+if [ -d "$LOCAL_RECIPE_DIR" ]; then
+    echo "Overlaying local recipe from $LOCAL_RECIPE_DIR onto $WORK_DIR/recipe/..."
+    if [ -d "$LOCAL_RECIPE_DIR/patches" ]; then
+        rm -rf "$WORK_DIR/recipe/patches"
+        cp -r "$LOCAL_RECIPE_DIR/patches" "$WORK_DIR/recipe/patches"
+        echo "  patches/: replaced with local copy"
+    fi
+    for f in "$LOCAL_RECIPE_DIR"/*; do
+        if [ -f "$f" ]; then
+            cp -v "$f" "$WORK_DIR/recipe/"
         fi
-    done < "$PATCHES_TO_DISABLE_FILE"
-fi
-
-CONDA_PATCHES_DIR="${SCRIPT_DIR}/patches"
-if [ -d "$CONDA_PATCHES_DIR" ] && [ -n "$(ls -A "$CONDA_PATCHES_DIR" 2>/dev/null)" ]; then
-    echo "Applying local patches from $CONDA_PATCHES_DIR over recipe/patches..."
-    cp -v "$CONDA_PATCHES_DIR"/*.patch "$RECIPE_PATCHES_DIR/" 2>/dev/null || true
+    done
 fi
 
 # -----------------------------------------------------------------------------
 # Detect version and rewrite meta.yaml
 # -----------------------------------------------------------------------------
-echo "Detecting version from CMakeLists.txt..."
-DETECTED_VERSION=$(grep 'set(NVIMGCODEC_VERSION "' "$PROJECT_ROOT/CMakeLists.txt" | head -1 | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/')
-[ -z "$DETECTED_VERSION" ] && { echo "Error: Could not detect version from CMakeLists.txt"; exit 1; }
+echo "Detecting version from VERSION.txt file..."
+VERSION_FILE="$PROJECT_ROOT/VERSION.txt"
+[ -f "$VERSION_FILE" ] || { echo "Error: VERSION file not found at $VERSION_FILE"; exit 1; }
+DETECTED_VERSION=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' "$VERSION_FILE" | head -1)
+[ -z "$DETECTED_VERSION" ] && { echo "Error: Could not parse version from $VERSION_FILE"; exit 1; }
 echo "Detected version: $DETECTED_VERSION"
 echo ""
 
 META_YAML="${WORK_DIR}/recipe/meta.yaml"
 cp "$META_YAML" "${META_YAML}.orig"
-export DETECTED_VERSION META_YAML CONDA_BUILD_LOCAL PROJECT_ROOT PATCHES_TO_DISABLE_FILE
+export DETECTED_VERSION META_YAML CONDA_BUILD_LOCAL PROJECT_ROOT
 python3 "${CONDA_SCRIPTS_DIR}/rewrite_meta_yaml.py"
 
 echo ""
@@ -335,8 +336,10 @@ if [ "$CONDA_BUILD_LOCAL" = "1" ]; then
         echo ""
     }
 
-    PYVER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null)
-    echo "Using Python: ${PYVER:-unknown} (variant config will pin this version)."
+    # Pin the build's Python variant. Must match test/test_conda.sh's PYVER, otherwise
+    # the solver silently pulls nvimgcodec from conda-forge at test time.
+    PYVER="${PYVER:-3.12}"
+    echo "Using Python: ${PYVER} (variant config will pin this version)."
     echo ""
 
     command -v conda &>/dev/null || { echo "Error: conda not found. Activate a conda environment and retry."; exit 1; }
@@ -408,10 +411,12 @@ else
     fi
 
     if [ $# -eq 0 ]; then
+        # Python pin must match test/test_conda.sh's PYVER.
+        DOCKER_PYVER="${PYVER:-3.12}"
         if [[ "$FEEDSTOCK_NAME" == *"libnvimgcodec"* ]]; then
             CONFIG="linux_64_c_stdlib_version2.17cuda_compiler_version${CUDA_VER}"
         else
-            CONFIG="linux_64_c_stdlib_version2.17cuda_compiler_version${CUDA_VER}python3.10.____cpython"
+            CONFIG="linux_64_c_stdlib_version2.17cuda_compiler_version${CUDA_VER}python${DOCKER_PYVER}.____cpython"
         fi
         echo "No config specified, using default (CUDA ${CUDA_VER}): $CONFIG"
         echo ""
@@ -431,7 +436,7 @@ fi
 # Optional tarball (single feedstock build)
 # -----------------------------------------------------------------------------
 [ "$CREATE_TARBALL" = "1" ] && [ -n "$CONDA_BUILD_OUTPUT_DIR" ] && [ -d "$CONDA_BUILD_OUTPUT_DIR" ] && {
-    TARBALL_NAME="nvimgcodec-conda-packages-$(date +%Y%m%d-%H%M%S).tar.gz"
+    TARBALL_NAME="nvimgcodec-conda-packages-cu${CUDA_VER%%.*}-$(date +%Y%m%d-%H%M%S).tar.gz"
     TARBALL_PATH="${SCRIPT_DIR}/${TARBALL_NAME}"
     echo "Creating tarball: $TARBALL_PATH"
     tar -czvf "$TARBALL_PATH" -C "$CONDA_BUILD_OUTPUT_DIR" .

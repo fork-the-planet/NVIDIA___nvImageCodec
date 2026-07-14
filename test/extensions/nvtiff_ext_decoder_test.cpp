@@ -21,6 +21,7 @@
 #include <parsers/tiff.h>
 #include <parsers/parser_test_utils.h>
 #include <test_utils.h>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -50,7 +51,7 @@ public:
             NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
         ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_tiff_parser_extension_desc(&tiff_parser_extension_desc));
         extensions_.emplace_back();
-        nvimgcodecExtensionCreate(instance_, &extensions_.back(), &tiff_parser_extension_desc);
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &tiff_parser_extension_desc));
 
         nvimgcodecExtensionDesc_t nvtiff_extension_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
         ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_nvtiff_extension_desc(&nvtiff_extension_desc));
@@ -77,21 +78,83 @@ public:
     nvimgcodecSampleFormat_t sample_format;
 };
 
-TEST_P(NvTiffExtDecoderTest, SingleImage)
-{
-
 #if defined(_WIN32) || defined(_WIN64)
-    if (CC_major < 7) {
-        GTEST_SKIP() << "On Windows, nvCOMP deflate requires sm_70 or higher to work.";
-    }
+#define NVTIFF_SKIP_IF_NEEDED()                                                                       \
+    do {                                                                                              \
+        if (CC_major < 7)                                                                             \
+            GTEST_SKIP() << "On Windows, nvCOMP deflate requires sm_70 or higher to work.";           \
+    } while (0)
+#else
+#define NVTIFF_SKIP_IF_NEEDED() do {} while (0)
 #endif
-    TestSingleImage(image_path, sample_format);
+
+TEST_P(NvTiffExtDecoderTest, SingleImageStrideContiguous)
+{
+    NVTIFF_SKIP_IF_NEEDED();
+    TestSingleImage(image_path, sample_format, StrideMode::Contiguous);
 }
+TEST_P(NvTiffExtDecoderTest, SingleImageStrideSamePadAllPlanes)
+{
+    NVTIFF_SKIP_IF_NEEDED();
+    TestSingleImage(image_path, sample_format, StrideMode::SamePadAllPlanes);
+}
+TEST_P(NvTiffExtDecoderTest, SingleImageStrideDiffPadPerPlane)
+{
+    NVTIFF_SKIP_IF_NEEDED();
+    TestSingleImage(image_path, sample_format, StrideMode::DiffPadPerPlane);
+}
+
+// Higher-precision (uint16) reference decode tests; same extension setup as
+// NvTiffExtDecoderTestBase, driven through the path+format+type fixture. The
+// uint16 TIFF is deflate-compressed, so this lives under the nvCOMP guard.
+class NvTiffExtDecoderTestHighPrec : public CommonExtDecoderTestWithPathFormatAndType
+{
+  public:
+    void SetUp() override
+    {
+        CommonExtDecoderTestWithPathFormatAndType::SetUp();
+
+        nvimgcodecExtensionDesc_t tiff_parser_extension_desc{
+            NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_tiff_parser_extension_desc(&tiff_parser_extension_desc));
+        extensions_.emplace_back();
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &tiff_parser_extension_desc));
+
+        nvimgcodecExtensionDesc_t nvtiff_extension_desc{NVIMGCODEC_STRUCTURE_TYPE_EXTENSION_DESC, sizeof(nvimgcodecExtensionDesc_t), 0};
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, get_nvtiff_extension_desc(&nvtiff_extension_desc));
+        extensions_.emplace_back();
+        ASSERT_EQ(NVIMGCODEC_STATUS_SUCCESS, nvimgcodecExtensionCreate(instance_, &extensions_.back(), &nvtiff_extension_desc));
+
+        CommonExtDecoderTestWithPathFormatAndType::CreateDecoder();
+    }
+};
+
+DEFINE_SINGLE_IMAGE_HIGHPREC_STRIDE_TESTS(NvTiffExtDecoderTestHighPrec)
 
 #if SKIP_NVTIFF_WITH_NVCOMP_TESTS_ENABLED
     #pragma message("Skipping nvTIFF tests that require nvCOMP")
     GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(NvTiffExtDecoderTest);
+    GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(NvTiffExtDecoderTestHighPrec);
 #else
+INSTANTIATE_TEST_SUITE_P(NVTIFF_DECODE_HIGHPREC_UINT16,
+    NvTiffExtDecoderTestHighPrec,
+    Combine(
+        Values("tiff/cat-300572_640_uint16.tiff"),
+        Values(NVIMGCODEC_SAMPLEFORMAT_I_RGB, NVIMGCODEC_SAMPLEFORMAT_I_BGR,
+               NVIMGCODEC_SAMPLEFORMAT_P_RGB, NVIMGCODEC_SAMPLEFORMAT_P_BGR),
+        Values(NVIMGCODEC_SAMPLE_DATA_TYPE_UINT16)
+    )
+);
+
+INSTANTIATE_TEST_SUITE_P(NVTIFF_DECODE_HIGHPREC_FP32,
+    NvTiffExtDecoderTestHighPrec,
+    Combine(
+        Values("tiff/cat-300572_640_fp32.tiff"),
+        Values(NVIMGCODEC_SAMPLEFORMAT_I_RGB), // nvtiff can decode only to interleaved, and we don't allow conversions with FP32 right now
+        Values(NVIMGCODEC_SAMPLE_DATA_TYPE_FLOAT32)
+    )
+);
+
 INSTANTIATE_TEST_SUITE_P(NVTIFF_DECODE,
     NvTiffExtDecoderTest,
     Combine(
@@ -127,10 +190,7 @@ INSTANTIATE_TEST_SUITE_P(NVTIFF_DECODE_FP32_TO_UINT8,
 
 class NvTiffExtDecoderTestWithoutNvCOMP : public NvTiffExtDecoderTest {};
 
-TEST_P(NvTiffExtDecoderTestWithoutNvCOMP, SingleImage)
-{
-    TestSingleImage(image_path, sample_format);
-}
+DEFINE_SINGLE_IMAGE_STRIDE_TESTS(NvTiffExtDecoderTestWithoutNvCOMP)
 
 INSTANTIATE_TEST_SUITE_P(NVTIFF_DECODE_WITHOUT_COMPRESSION,
     NvTiffExtDecoderTestWithoutNvCOMP,

@@ -21,12 +21,15 @@
 #include <cassert>
 #include <cstring>
 #include <iostream>
+#include <sstream>
+#include <string>
 #include <memory>
 #include <numeric>
 #include <nvtx3/nvtx3.hpp>
 #include <set>
 #include <vector>
 #include "errors_handling.h"
+#include "imgproc/image_info_checks.h"
 #include "log.h"
 #include "nvjpeg_utils.h"
 #include "type_convert.h"
@@ -40,6 +43,90 @@
 namespace nvjpeg {
 
 namespace {
+
+bool MarkerHasPayload(uint8_t marker)
+{
+    return marker != 0x01 && !(marker >= 0xd0 && marker <= 0xd9);
+}
+
+bool NeedsLosslessJpegGuard(const NvjpegVersion& nvjpeg_version)
+{
+    return nvjpeg_version < LOSSLESS_JPEG_FIX_VERSION;
+}
+
+enum class MarkerScanResult
+{
+    kNoProblematicMarkerBeforeSof3,
+    kProblematicMarkerBeforeSof3,
+    kInvalidStream,
+};
+
+nvimgcodecProcessingStatus_t ParserStatusToProcessingStatus(nvimgcodecStatus_t status)
+{
+    switch (status) {
+    case NVIMGCODEC_STATUS_BAD_CODESTREAM:
+    case NVIMGCODEC_STATUS_EXTENSION_BAD_CODE_STREAM:
+        return NVIMGCODEC_PROCESSING_STATUS_IMAGE_CORRUPTED;
+    case NVIMGCODEC_STATUS_CODESTREAM_UNSUPPORTED:
+    case NVIMGCODEC_STATUS_EXTENSION_CODESTREAM_UNSUPPORTED:
+        return NVIMGCODEC_PROCESSING_STATUS_CODESTREAM_UNSUPPORTED;
+    default:
+        return NVIMGCODEC_PROCESSING_STATUS_FAIL;
+    }
+}
+
+// Shared marker-scan helper: advances pos past the current marker's payload.
+// Returns false if the stream is malformed. Call after reading the marker byte.
+bool AdvancePastMarkerPayload(const unsigned char* data, size_t size, size_t& pos, uint8_t marker)
+{
+    if (!MarkerHasPayload(marker))
+        return true;
+    if (pos + 2 > size)
+        return false;
+    const uint16_t segment_size = (static_cast<uint16_t>(data[pos]) << 8) | data[pos + 1];
+    if (segment_size < 2 || segment_size > size - pos)
+        return false;
+    pos += segment_size;
+    return true;
+}
+
+// Returns whether the lossless JPEG stream contains any payload-bearing marker before SOF3
+// that nvjpeg < 13.0.2 cannot handle correctly. Two failure modes exist:
+//   - GPU: get_image_info hits default:ERR_UNKNOWN_HEADER and the decode kernel skips the image
+//          and silently zero-fills the output (e.g. COMMENT, APP2+, DRI)
+//   - CPU: nvjpegJpegStreamParse fails with "Bad jpeg" for DHT before SOF3
+// The only payload-bearing markers that are safe before SOF3 on old nvjpeg are APP0 and APP1.
+MarkerScanResult ScanMarkersBeforeSof3(const unsigned char* data, size_t size)
+{
+    if (!data || size < 2 || data[0] != 0xff || data[1] != 0xd8)
+        return MarkerScanResult::kInvalidStream;
+
+    size_t pos = 2;
+    while (pos < size) {
+        if (data[pos] != 0xff)
+            return MarkerScanResult::kInvalidStream;
+        do { ++pos; } while (pos < size && data[pos] == 0xff);
+        if (pos >= size)
+            return MarkerScanResult::kInvalidStream;
+
+        const uint8_t marker = data[pos++];
+        if (marker == 0x00)
+            return MarkerScanResult::kInvalidStream;
+        if (marker == 0xc3) // SOF3 reached, no problematic marker found
+            return MarkerScanResult::kNoProblematicMarkerBeforeSof3;
+        if (marker == 0xd9 || marker == 0xda) // EOI / SOS
+            return MarkerScanResult::kInvalidStream;
+
+        if (MarkerHasPayload(marker)) {
+            if (!AdvancePastMarkerPayload(data, size, pos, marker))
+                return MarkerScanResult::kInvalidStream;
+            // APP0 (0xE0) and APP1 (0xE1) are safe; everything else (DHT, COM, APP2+, DRI) is not.
+            if (marker != 0xe0 && marker != 0xe1)
+                return MarkerScanResult::kProblematicMarkerBeforeSof3;
+        }
+    }
+    return MarkerScanResult::kInvalidStream;
+}
 
 struct DecoderImpl
 {
@@ -89,6 +176,8 @@ struct DecoderImpl
 
     static nvimgcodecStatus_t static_destroy(nvimgcodecDecoder_t decoder);
 
+    void parseOptions(const char* options);
+
     const char* plugin_id_;
     nvjpegHandle_t handle_;
     nvjpegDevAllocatorV2_t device_allocator_;
@@ -99,6 +188,10 @@ struct DecoderImpl
     cudaEvent_t event_;
     std::vector<nvjpegJpegStream_t> nvjpeg_streams_;
     const nvimgcodecExecutionParams_t* exec_params_;
+    // Default true: matches libjpeg's chroma upsampling behaviour.
+    bool fancy_upsampling_ = true;
+    unsigned int nvjpeg_extra_flags_ = 0;
+    NvjpegVersion nvjpeg_version_;
 };
 
 
@@ -141,7 +234,9 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(const nvimgcodecImageDesc_t*
         nvimgcodecJpegImageInfo_t jpeg_info{NVIMGCODEC_STRUCTURE_TYPE_JPEG_IMAGE_INFO, sizeof(nvimgcodecJpegImageInfo_t), nullptr};
         nvimgcodecImageInfo_t cs_image_info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), static_cast<void*>(&jpeg_info)};
 
-        code_stream->getImageInfo(code_stream->instance, &cs_image_info);
+        auto ret = code_stream->getImageInfo(code_stream->instance, &cs_image_info);
+        if (ret != NVIMGCODEC_STATUS_SUCCESS)
+            return ParserStatusToProcessingStatus(ret);
         bool is_jpeg = strcmp(cs_image_info.codec_name, "jpeg") == 0;
         bool is_lossless_huffman = jpeg_info.encoding == NVIMGCODEC_JPEG_ENCODING_LOSSLESS_HUFFMAN;
         if (!is_jpeg) {
@@ -152,7 +247,7 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(const nvimgcodecImageDesc_t*
 
         XM_CHECK_NULL(image);
         nvimgcodecImageInfo_t image_info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};
-        auto ret = image->getImageInfo(image->instance, &image_info);
+        ret = image->getImageInfo(image->instance, &image_info);
         if (ret != NVIMGCODEC_STATUS_SUCCESS)
             return NVIMGCODEC_STATUS_EXTENSION_INTERNAL_ERROR;
 
@@ -168,8 +263,11 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(const nvimgcodecImageDesc_t*
 
         if (image_info.plane_info[0].sample_type != NVIMGCODEC_SAMPLE_DATA_TYPE_UINT16)
             status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
-        
-        XM_CHECK_NULL(code_stream); 
+
+        if (!nvimgcodec::check_planes_consistency(framework_, plugin_id_, image_info)) {
+            status |= NVIMGCODEC_PROCESSING_STATUS_SAMPLE_TYPE_UNSUPPORTED;
+        }
+
         nvimgcodecCodeStreamInfo_t codestream_info{NVIMGCODEC_STRUCTURE_TYPE_CODE_STREAM_INFO, sizeof(nvimgcodecCodeStreamInfo_t), nullptr};
         ret = code_stream->getCodeStreamInfo(code_stream->instance, &codestream_info);
         if (ret != NVIMGCODEC_STATUS_SUCCESS)
@@ -188,7 +286,6 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(const nvimgcodecImageDesc_t*
         if (status != NVIMGCODEC_PROCESSING_STATUS_SUCCESS)
             return status;
 
-
         auto* io_stream = code_stream->io_stream;
         XM_CHECK_NULL(io_stream);
 
@@ -202,6 +299,24 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(const nvimgcodecImageDesc_t*
         }
         assert(encoded_stream_data != nullptr);
         assert(encoded_stream_data_size > 0);
+
+        const auto marker_scan =
+            ScanMarkersBeforeSof3(static_cast<const unsigned char*>(encoded_stream_data), encoded_stream_data_size);
+        if (marker_scan == MarkerScanResult::kInvalidStream) {
+            return NVIMGCODEC_PROCESSING_STATUS_IMAGE_CORRUPTED;
+        }
+
+        // Pre-flight check for nvjpeg bugs fixed in 13.0.2: certain marker orderings before SOF3
+        // cause either a silent zero-filled output (GPU path) or a "Bad jpeg" parse error (CPU path).
+        // We detect these here and return CODESTREAM_UNSUPPORTED so the framework falls back to
+        // libjpeg-turbo, rather than silently producing corrupt output or an opaque failure.
+        if (NeedsLosslessJpegGuard(nvjpeg_version_) && marker_scan == MarkerScanResult::kProblematicMarkerBeforeSof3) {
+            NVIMGCODEC_LOG_WARNING(framework_, plugin_id_,
+                "JPEG lossless stream has a payload marker before SOF3 that nvJPEG "
+                    << nvjpeg_version_ << " cannot handle (only APP0/APP1 are safe before SOF3);"
+                    << " upgrade to nvJPEG " << LOSSLESS_JPEG_FIX_VERSION << " or newer");
+            return NVIMGCODEC_PROCESSING_STATUS_CODESTREAM_UNSUPPORTED;
+        }
 
         XM_CHECK_NVJPEG(nvjpegJpegStreamParse(
             handle_, static_cast<const unsigned char*>(encoded_stream_data), encoded_stream_data_size, 0, 0, nvjpeg_stream));
@@ -220,6 +335,27 @@ nvimgcodecProcessingStatus_t DecoderImpl::canDecode(const nvimgcodecImageDesc_t*
     }
 }
 
+void DecoderImpl::parseOptions(const char* options)
+{
+    std::istringstream iss(options ? options : "");
+    std::string token;
+    while (std::getline(iss, token, ' ')) {
+        std::string::size_type colon = token.find(':');
+        std::string::size_type equal = token.find('=');
+        if (colon == std::string::npos || equal == std::string::npos || colon > equal)
+            continue;
+        std::string module = token.substr(0, colon);
+        if (module != "" && module != "nvjpeg_lossless_decoder")
+            continue;
+        std::string option = token.substr(colon + 1, equal - colon - 1);
+        std::istringstream value(token.substr(equal + 1));
+        if (option == "fancy_upsampling")
+            value >> fancy_upsampling_;
+        else if (option == "extra_flags")
+            value >> nvjpeg_extra_flags_;
+    }
+}
+
 DecoderImpl::DecoderImpl(
     const char* plugin_id, const nvimgcodecFrameworkDesc_t* framework, const nvimgcodecExecutionParams_t* exec_params, const char* options)
     : plugin_id_(plugin_id)
@@ -227,6 +363,7 @@ DecoderImpl::DecoderImpl(
     , pinned_allocator_{nullptr, nullptr, nullptr}
     , framework_(framework)
     , exec_params_(exec_params)
+    , nvjpeg_version_(get_nvjpeg_version())
 {
     bool use_nvjpeg_create_ex_v2 = false;
     if (nvjpegIsSymbolAvailable("nvjpegCreateExV2")) {
@@ -245,12 +382,13 @@ DecoderImpl::DecoderImpl(
             device_allocator_.dev_malloc && device_allocator_.dev_free && pinned_allocator_.pinned_malloc && pinned_allocator_.pinned_free;
     }
 
-    NvjpegVersion nvjpeg_version = get_nvjpeg_version();
-    if (!nvjpeg_version) {
+    parseOptions(options);
+
+    if (!nvjpeg_version_) {
         NVIMGCODEC_LOG_ERROR(framework_, plugin_id_, "Failed to get nvJPEG version");
         throw std::runtime_error("Failed to get nvJPEG version");
     }
-    unsigned int nvjpeg_flags = get_nvjpeg_flags("nvjpeg_lossless_decoder", nvjpeg_version, options);
+    unsigned int nvjpeg_flags = get_nvjpeg_flags(nvjpeg_version_, fancy_upsampling_, nvjpeg_extra_flags_);
     if (use_nvjpeg_create_ex_v2) {
         XM_CHECK_NVJPEG(nvjpegCreateExV2(NVJPEG_BACKEND_LOSSLESS_JPEG, &device_allocator_, &pinned_allocator_, nvjpeg_flags, &handle_));
     } else {
@@ -413,7 +551,7 @@ nvimgcodecStatus_t DecoderImpl::decodeBatch(const nvimgcodecImageDesc_t** images
             assert(encoded_stream_data != nullptr);
             assert(encoded_stream_data_size > 0);
 
-            nvjpegImage_t nvjpeg_image;
+            nvjpegImage_t nvjpeg_image{};
             unsigned char* ptr = device_buffer;
             for (uint32_t c = 0; c < image_info.num_planes; ++c) {
                 nvjpeg_image.channel[c] = ptr;

@@ -28,6 +28,13 @@ constexpr size_t TypeSize(nvimgcodecSampleDataType_t type)
     return static_cast<size_t>(type) >> (8 + 3);
 }
 
+// Resolve a plane_info.precision value to its user-visible bitcount: pass-through when
+// non-zero, otherwise the sample type's full bitdepth (the C-layer's 0 sentinel).
+constexpr int ResolvePrecision(uint8_t precision, nvimgcodecSampleDataType_t sample_type)
+{
+    return precision != 0 ? precision : static_cast<int>(TypeSize(sample_type) * 8);
+}
+
 // returns size, in bytes, of a buffer that is required to fit whole image describe by image_info, including padding bytes
 constexpr size_t GetBufferSize(const nvimgcodecImageInfo_t& image_info)
 {

@@ -247,6 +247,7 @@ int process_one_image(nvimgcodecInstance_t instance, fs::path input_path, fs::pa
             image_info.plane_info[c].row_stride = image_info.plane_info[0].width * bytes_per_element;
             image_info.plane_info[c].sample_type = image_info.plane_info[0].sample_type;
             image_info.plane_info[c].num_channels = 1;
+            image_info.plane_info[c].precision = image_info.plane_info[0].precision;
         }
     }
 
@@ -284,14 +285,21 @@ int process_one_image(nvimgcodecInstance_t instance, fs::path input_path, fs::pa
         }
         nvimgcodecFuture_t future;
         CHECK_NVIMGCODEC(nvimgcodecDecoderDecode(decoder, &code_stream, &image, 1, &decode_params, &future));
-        nvimgcodecProcessingStatus_t decode_status;
+        // RAII destroy on every exit path (early return on FAIL, exception from
+        // CHECK_NVIMGCODEC, or normal end-of-iteration); same pattern as the
+        // decode_future_raii / encode_future_raii guards below.
+        std::unique_ptr<std::remove_pointer<nvimgcodecFuture_t>::type, decltype(&nvimgcodecFutureDestroy)> future_raii(
+                future, &nvimgcodecFutureDestroy);
+        // nvimgcodecFutureGetProcessingStatus writes batch_size entries; declare
+        // as a 1-element array (matching the batch_size=1 above) so the array
+        // semantics are explicit at the call site.
+        nvimgcodecProcessingStatus_t decode_status[1];
         size_t status_size;
-        CHECK_NVIMGCODEC(nvimgcodecFutureGetProcessingStatus(future, &decode_status, &status_size));
-        if (decode_status != NVIMGCODEC_PROCESSING_STATUS_SUCCESS) {
-            std::cerr << "Error: Something went wrong during warmup decoding - processing status: " << decode_status << std::endl;
+        CHECK_NVIMGCODEC(nvimgcodecFutureGetProcessingStatus(future, decode_status, &status_size));
+        if (decode_status[0] != NVIMGCODEC_PROCESSING_STATUS_SUCCESS) {
+            std::cerr << "Error: Something went wrong during warmup decoding - processing status: " << decode_status[0] << std::endl;
             return EXIT_FAILURE;
         }
-        CHECK_NVIMGCODEC(nvimgcodecFutureDestroy(future));
 
         if (warmup_iter == (params.warmup - 1)) {
             std::cout << "Warmup done!" << std::endl;
@@ -305,12 +313,15 @@ int process_one_image(nvimgcodecInstance_t instance, fs::path input_path, fs::pa
             decode_future, &nvimgcodecFutureDestroy);
 
     size_t status_size;
-    nvimgcodecProcessingStatus_t decode_status;
-    CHECK_NVIMGCODEC(nvimgcodecFutureGetProcessingStatus(decode_future, &decode_status, &status_size));
+    // nvimgcodecFutureGetProcessingStatus writes batch_size entries; declare
+    // as a 1-element array (matching the batch_size=1 above) so the array
+    // semantics are explicit at the call site.
+    nvimgcodecProcessingStatus_t decode_status[1];
+    CHECK_NVIMGCODEC(nvimgcodecFutureGetProcessingStatus(decode_future, decode_status, &status_size));
     CHECK_CUDA(cudaDeviceSynchronize()); // makes GPU wait until all decoding is finished
     decode_time = wtime() - decode_time; // record wall clock time on CPU (now includes GPU time as well)
-    if (decode_status != NVIMGCODEC_PROCESSING_STATUS_SUCCESS) {
-        std::cerr << "Error: Something went wrong during decoding - processing status: " << decode_status << std::endl;
+    if (decode_status[0] != NVIMGCODEC_PROCESSING_STATUS_SUCCESS) {
+        std::cerr << "Error: Something went wrong during decoding - processing status: " << decode_status[0] << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -349,12 +360,15 @@ int process_one_image(nvimgcodecInstance_t instance, fs::path input_path, fs::pa
             encode_future, &nvimgcodecFutureDestroy);
 
 
-    nvimgcodecProcessingStatus_t encode_status;
-    CHECK_NVIMGCODEC(nvimgcodecFutureGetProcessingStatus(encode_future, &encode_status, &status_size));
+    // nvimgcodecFutureGetProcessingStatus writes batch_size entries; declare
+    // as a 1-element array (matching the batch_size=1 above) so the array
+    // semantics are explicit at the call site.
+    nvimgcodecProcessingStatus_t encode_status[1];
+    CHECK_NVIMGCODEC(nvimgcodecFutureGetProcessingStatus(encode_future, encode_status, &status_size));
     CHECK_CUDA(cudaDeviceSynchronize());
     encode_time = wtime() - encode_time;
-    if (encode_status != NVIMGCODEC_PROCESSING_STATUS_SUCCESS) {
-        std::cerr << "Error: Something went wrong during encoding - processing status: " << encode_status << std::endl;
+    if (encode_status[0] != NVIMGCODEC_PROCESSING_STATUS_SUCCESS) {
+        std::cerr << "Error: Something went wrong during encoding - processing status: " << encode_status[0] << std::endl;
     }
 
     double total_time = parse_time + decode_time + encode_time;
@@ -850,7 +864,7 @@ int main(int argc, const char* argv[])
         instance_create_info.message_severity = verbosity2severity(params.verbose);
         instance_create_info.message_category = NVIMGCODEC_DEBUG_MESSAGE_CATEGORY_ALL;
 
-        nvimgcodecInstanceCreate(&instance, &instance_create_info);
+        CHECK_NVIMGCODEC(nvimgcodecInstanceCreate(&instance, &instance_create_info));
 
 #ifdef NVIMGCODEC_REGISTER_EXT_API
         nvimgcodecExtension_t pnm_extension{nullptr};

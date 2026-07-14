@@ -275,5 +275,13 @@ TEST_F(PNMParserPluginTest, LowercaseP)
         nvimgcodecCodeStreamGetImageInfo(this->stream_handle_, &image_info));
 }
 
+TEST_F(PNMParserPluginTest, IntParsingOverflow)
+{
+    auto buffer = read_file(resources_dir + "/pnm/corrupted/int_overflow.pnm");
+    LoadImageFromHostMemory(instance_, stream_handle_, buffer.data(), buffer.size());
+    nvimgcodecImageInfo_t info{NVIMGCODEC_STRUCTURE_TYPE_IMAGE_INFO, sizeof(nvimgcodecImageInfo_t), 0};
+    ASSERT_EQ(NVIMGCODEC_STATUS_BAD_CODESTREAM, nvimgcodecCodeStreamGetImageInfo(stream_handle_, &info));
+}
+
 
 }} // namespace nvimgcodec::test

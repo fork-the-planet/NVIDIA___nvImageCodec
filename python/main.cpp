@@ -74,6 +74,12 @@ PYBIND11_MODULE(nvimgcodec_impl, m, py::mod_gil_not_used())
     m.attr("__version__") = ver_ss.str();
     m.attr("__cuda_version__") = properties.cudart_version;
 
+    // Sentinel device IDs from <nvimgcodec.h>. Re-exported so callers don't have
+    // to spell out the magic numbers (`-1`, `-99999`) when constructing
+    // Decoder/Encoder objects.
+    m.attr("NVIMGCODEC_DEVICE_CURRENT") = NVIMGCODEC_DEVICE_CURRENT;
+    m.attr("NVIMGCODEC_DEVICE_CPU_ONLY") = NVIMGCODEC_DEVICE_CPU_ONLY;
+
     BackendKind::exportToPython(m);
     LoadHintPolicy::exportToPython(m);
     Backend::exportToPython(m);

@@ -525,9 +525,11 @@ def test_tiff_tag_reading_multiple_subimages_and_tags(input_img_file, subimage_t
 
 
 @t.mark.parametrize("file_name, expected_tag_ids", [
-    ("tiff/Ventana-1.bif", [256, 257, 258, 259, 262, 270, 273, 277, 278, 279, 282, 283, 284, 296, 305, 306, 339, 700]),
+    # Ventana-1.bif and JP2K-33003-1.svs do not carry a SampleFormat (339) tag in their first
+    # IFD (verified against the raw TIFF bytes); nvTIFF 0.8 correctly reports only present tags.
+    ("tiff/Ventana-1.bif", [256, 257, 258, 259, 262, 270, 273, 277, 278, 279, 282, 283, 284, 296, 305, 306, 700]),
     ("tiff/Alex_2016-01-14_1300Z_(Geotiff).tif", [256, 257, 258, 259, 262, 273, 277, 278, 279, 284, 317, 339, 33550, 33922, 34735, 34736, 34737]),
-    ("tiff/JP2K-33003-1.svs", [254, 256, 257, 258, 259, 262, 270, 277, 284, 322, 323, 324, 325, 339, 32997, 34675]),
+    ("tiff/JP2K-33003-1.svs", [254, 256, 257, 258, 259, 262, 270, 277, 284, 322, 323, 324, 325, 32997, 34675]),
 ])
 def test_tiff_tag_list(file_name, expected_tag_ids):
     """Test that TIFF_TAG_LIST returns the correct list of available tag IDs"""
